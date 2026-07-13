@@ -13,13 +13,15 @@ pub mod serial;
 pub mod qemu;
 pub mod gdt;
 pub mod interrupts;
+pub mod memory;
 
 use core::panic::PanicInfo;
 
 /// Bring up the parts of the kernel every entry point needs: GDT/TSS so the
 /// double-fault IST stack exists, then the IDT, then unmask the PIC and
 /// enable interrupts. Physical memory and paging are brought up separately
-/// by the caller (M3/M4), which has the boot info the bootloader handed it.
+/// via `init_memory`, which needs the boot info the bootloader handed the
+/// caller.
 pub fn init() {
     gdt::init();
     interrupts::init_idt();
@@ -29,6 +31,17 @@ pub fn init() {
     // or an IRQ could arrive before the PIC's own remap is complete.
     unsafe { interrupts::PICS.lock().initialize() };
     x86_64::instructions::interrupts::enable();
+}
+
+/// Brings up the physical frame allocator from the bootloader's memory map.
+/// Separate from `init` because it needs the `BootInfo` the bootloader
+/// handed the entry point, which `init` (called identically by every entry
+/// point, test or not) does not take.
+pub fn init_memory(boot_info: &'static bootloader::BootInfo) {
+    // SAFETY: `boot_info` is the genuine value the bootloader passed to
+    // this entry point via `entry_point!`, and this runs once during boot
+    // before anything could have allocated a frame.
+    unsafe { memory::init(&boot_info.memory_map, boot_info.physical_memory_offset) };
 }
 
 /// Spin forever with `hlt` between iterations instead of busy-looping, so an
@@ -85,8 +98,9 @@ use bootloader::{entry_point, BootInfo};
 entry_point!(test_kernel_main);
 
 #[cfg(test)]
-fn test_kernel_main(_boot_info: &'static BootInfo) -> ! {
+fn test_kernel_main(boot_info: &'static BootInfo) -> ! {
     init();
+    init_memory(boot_info);
     test_main();
     hlt_loop();
 }

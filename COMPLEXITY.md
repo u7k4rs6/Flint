@@ -17,6 +17,28 @@ just what the code does.
   IOAPIC path. APIC is the natural extension once SMP is in scope (out of
   scope for v1 per Doc 3 section 6.4).
 
+## Frame alloc / frame free (M3)
+
+- **Cost:** `init` is O(frames) -- every usable frame is visited once to
+  link it into the free list, which cannot be avoided regardless of
+  allocator shape (something has to enumerate what's free). After that,
+  `allocate_frame` and `deallocate_frame` are both O(1): pop/push the head
+  of an intrusive singly linked free list.
+- **Alternative:** a bitmap, one bit per frame -- compact, easy to reason
+  about, but a naive scan for the next free bit is O(frames) per
+  allocation unless a "last freed" hint is tracked.
+- **Tradeoff:** Doc 2 section 11 frames this as "storage for the list vs
+  scan time." The intrusive design sidesteps that tradeoff by storing each
+  free list node *inside the free frame itself* (its first 8 bytes hold
+  the physical address of the next free frame, reached through the
+  bootloader's physical-memory offset mapping) rather than in a
+  separately allocated structure -- there is no free-list storage cost
+  because the "storage" is memory that is otherwise idle while unused.
+  The real cost moves elsewhere: `deallocate_frame` is `unsafe` and does a
+  raw pointer write into physical memory, so an incorrect caller (freeing
+  a frame that is still referenced) corrupts that frame's contents
+  immediately rather than merely mis-tracking a bitmap bit.
+
 ## Double-fault IST stack (M2)
 
 - **Cost:** O(1) -- a fixed, pre-allocated 20 KiB stack, switched to by

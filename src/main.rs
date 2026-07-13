@@ -14,8 +14,9 @@ use flint::serial_println;
 
 entry_point!(kmain);
 
-fn kmain(_boot_info: &'static BootInfo) -> ! {
+fn kmain(boot_info: &'static BootInfo) -> ! {
     flint::init();
+    flint::init_memory(boot_info);
 
     serial_println!("Flint kernel booting...");
     serial_println!("Flint v{} -- boot OK", env!("CARGO_PKG_VERSION"));

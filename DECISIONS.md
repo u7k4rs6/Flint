@@ -2,6 +2,12 @@
 
 Assumptions and judgment calls, most recent first within each milestone.
 
+## M3
+
+- **Intrusive free-list frame allocator instead of a bitmap or a `Vec`-backed free list.** The frame allocator has to exist *before* the heap does (frame alloc -> paging -> heap is the dependency order), so it cannot use `alloc::Vec` for its own bookkeeping. Threading the free list through the freed frames' own memory (via the bootloader's physical-memory offset mapping) sidesteps that ordering problem entirely and gives O(1) alloc/free with no separate storage, at the cost of every `deallocate_frame` being an unsafe raw write into physical memory. See `COMPLEXITY.md` for the full tradeoff writeup.
+
+- **Physical frame 0 is permanently excluded from the free list.** Doc 3 section 3 calls for leaving virtual page 0 unmapped (a null-pointer-deref defense); that's enforced at the paging layer in M4. Excluding *physical* frame 0 here too is an extra, cheap belt-and-suspenders: it guarantees frame 0 can never be the backing memory for any mapping the kernel makes, regardless of what a future paging bug might attempt.
+
 ## M2
 
 - **Two `x86_64` crate versions in the dependency graph.** `bootloader` 0.9.35 pins its own internal `x86_64 = 0.14.7` (resolved to 0.14.13); Flint's own code uses `x86_64 = "0.15"`. Cargo resolves both simultaneously since neither crosses the crate boundary as a shared type (the `bootloader::BootInfo` struct handed to `kmain` is plain data, not `x86_64` types). Confirmed this does not cause the `E0152 duplicate lang item` class of error by building and running the full test suite green.
