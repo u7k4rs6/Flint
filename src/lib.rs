@@ -5,17 +5,31 @@
 #![no_std]
 #![cfg_attr(test, no_main)]
 #![feature(custom_test_frameworks)]
+#![feature(abi_x86_interrupt)]
 #![test_runner(crate::test_runner)]
 #![reexport_test_harness_main = "test_main"]
 
 pub mod serial;
 pub mod qemu;
+pub mod gdt;
+pub mod interrupts;
 
 use core::panic::PanicInfo;
 
-/// Bring up the parts of the kernel every entry point needs. Grows with
-/// each milestone (GDT/IDT in M2, paging/heap in M4, ...).
-pub fn init() {}
+/// Bring up the parts of the kernel every entry point needs: GDT/TSS so the
+/// double-fault IST stack exists, then the IDT, then unmask the PIC and
+/// enable interrupts. Physical memory and paging are brought up separately
+/// by the caller (M3/M4), which has the boot info the bootloader handed it.
+pub fn init() {
+    gdt::init();
+    interrupts::init_idt();
+    // SAFETY: init_idt() has just installed handlers for every vector the
+    // PIC can raise (timer, keyboard), so it is safe to start delivering
+    // IRQs; PICS.lock().initialize() must run before interrupts::enable()
+    // or an IRQ could arrive before the PIC's own remap is complete.
+    unsafe { interrupts::PICS.lock().initialize() };
+    x86_64::instructions::interrupts::enable();
+}
 
 /// Spin forever with `hlt` between iterations instead of busy-looping, so an
 /// idle kernel is not pegging the (virtual) CPU.

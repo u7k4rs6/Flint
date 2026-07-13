@@ -2,6 +2,14 @@
 
 Assumptions and judgment calls, most recent first within each milestone.
 
+## M2
+
+- **Two `x86_64` crate versions in the dependency graph.** `bootloader` 0.9.35 pins its own internal `x86_64 = 0.14.7` (resolved to 0.14.13); Flint's own code uses `x86_64 = "0.15"`. Cargo resolves both simultaneously since neither crosses the crate boundary as a shared type (the `bootloader::BootInfo` struct handed to `kmain` is plain data, not `x86_64` types). Confirmed this does not cause the `E0152 duplicate lang item` class of error by building and running the full test suite green.
+
+- **`page_fault_handler` distinguishes ring 3 vs ring 0 via `PageFaultErrorCode::USER_MODE`, per Doc 3 section 5**, even though no user mode exists yet (M6): a user-mode fault reports and returns; a kernel-mode fault panics with a register dump and Cr2 (the faulting address). The "valid but unmapped, continue execution" demand-paging case from the PRD's definition of done is deferred to M4, once there is a heap/paging layer able to decide "unmapped-but-valid" vs "illegal."
+
+- **Double-fault-on-stack-overflow test uses its own `harness = false` integration test (`tests/stack_overflow.rs`)** rather than a `#[test_case]`, because the test's entire point is that the kernel never returns from `stack_overflow()` -- the custom-test-framework runner (which expects to keep running further tests afterward) is the wrong shape for a test that ends the boot. It installs its own single-purpose IDT where the double-fault handler reports `[ok]` and exits QEMU, instead of the kernel's normal double-fault handler, which panics (the right behavior for the real kernel, the wrong one to observe from a test that wants to see the fault fire cleanly).
+
 ## Scaffolding / M1
 
 - **Missing source docs.** The build brief references four specs in `docs/`: a PRD (Doc 1), the technical architecture (Doc 2), isolation and privilege (Doc 3), and a console/CLI doc (Doc 4). Only Doc 2 and Doc 3 were actually provided (Doc 3 three times, identical). Doc 1 (PRD) and Doc 4 (console/CLI) were never attached. The build brief itself restates the PRD's milestone list, gates, and definition of done, and the shell command set (`help`, `echo`, `meminfo`, `ps`, `ticks`/`uptime`) inline, so I proceeded using the brief plus Docs 2 and 3 as the source of truth rather than blocking on missing files. Noted here so the gap is a recorded decision, not a silent one.
