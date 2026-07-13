@@ -25,7 +25,14 @@ fn kmain(boot_info: &'static BootInfo) -> ! {
     #[cfg(test)]
     test_main();
 
-    flint::hlt_loop();
+    let (entry, stack_top) = flint::user::setup_shell();
+    serial_println!("Flint: dropping to ring 3, starting the shell (type 'help')");
+
+    // SAFETY: flint::init() has already loaded the GDT/TSS (including
+    // rsp0), and flint::user::setup_shell() just mapped entry/stack_top
+    // (and the shell's line buffer) as the user-accessible pages this
+    // function's contract requires.
+    unsafe { flint::user::enter_user_mode(entry, stack_top) };
 }
 
 /// The panic handler for normal (non-test) boots: print to serial and halt.

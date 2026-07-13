@@ -1,10 +1,11 @@
 //! Ring 3 setup: mapping an isolated, minimal user address range and
 //! transitioning into it. No process model or ELF loader yet (M8 stretch)
-//! -- this builds exactly enough to run the one hand-written demo program
-//! in `program.rs` and prove the ring 3 / syscall / validation machinery
-//! actually works end to end.
+//! -- this builds exactly enough to run the hand-written demo programs in
+//! `program.rs` and `shell_program.rs` and prove the ring 3 / syscall /
+//! validation machinery actually works end to end.
 
 pub mod program;
+pub mod shell_program;
 
 use crate::memory::paging::map_page;
 use x86_64::structures::paging::{Mapper, Page, PageTableFlags, Size4KiB};
@@ -17,17 +18,23 @@ use x86_64::VirtAddr;
 /// here can never share -- and therefore never accidentally weaken or be
 /// weakened by -- an existing mapping's page-table entries at any level.
 /// W xor X holds by construction: the code page is mapped without
-/// `WRITABLE`; the stack page is mapped with `WRITABLE` and `NO_EXECUTE`.
-/// Both live in their own separate PML4 slot from each other too, for the
-/// same reason (see DECISIONS.md M6).
+/// `WRITABLE`; the stack (and shell line buffer) pages are mapped with
+/// `WRITABLE` and `NO_EXECUTE`. Code lives in its own separate PML4 slot
+/// from the writable pages too, for the same reason (see DECISIONS.md
+/// M6). The stack and the buffer share a slot with each other on purpose:
+/// both want the exact same flags (`WRITABLE`, `USER_ACCESSIBLE`,
+/// `NO_EXECUTE`), so sharing intermediate page-table entries between them
+/// carries none of the cross-mapping risk that motivated separating code
+/// from data in the first place.
 const USER_CODE_ADDR: u64 = 0x_2000_0000_0000;
 const USER_STACK_TOP: u64 = 0x_3000_0000_1000;
 const USER_STACK_SIZE: u64 = 4096;
 
-/// Maps the user code and stack pages and copies the demo program's
-/// machine code into place. Returns `(entry_point, stack_top)` ready for
-/// `enter_user_mode`.
-pub fn setup() -> (VirtAddr, VirtAddr) {
+/// Maps a code page at `USER_CODE_ADDR` and a stack page at
+/// `USER_STACK_TOP`, copies `copy_len` bytes from `program_addr` into the
+/// code page, then makes it read-only + executable. Returns
+/// `(entry_point, stack_top)` ready for `enter_user_mode`.
+fn map_program(program_addr: *const u8, copy_len: usize) -> (VirtAddr, VirtAddr) {
     let code_page: Page<Size4KiB> = Page::containing_address(VirtAddr::new(USER_CODE_ADDR));
     // Mapped WRITABLE only long enough to copy the program's bytes in
     // below: even ring 0 cannot write through a page table entry that
@@ -48,15 +55,14 @@ pub fn setup() -> (VirtAddr, VirtAddr) {
         | PageTableFlags::NO_EXECUTE;
     map_page(stack_page, stack_flags).expect("failed to map user stack page");
 
-    // SAFETY: `program::user_entry`'s own doc comment guarantees the first
-    // `COPY_LEN` bytes from its address are safe to read (kernel .text, at
-    // least that many bytes of valid surrounding code); `code_page` was
-    // just mapped fresh above, writable, with exactly `COPY_LEN`-or-more
+    // SAFETY: the caller guarantees `[program_addr, program_addr +
+    // copy_len)` is readable kernel memory (both call sites below forward
+    // that to their own program modules' documented guarantees); `code_page`
+    // was just mapped fresh above, writable, with exactly `copy_len`-or-more
     // bytes of room (one 4 KiB page).
     unsafe {
-        let src = program::user_entry as *const () as *const u8;
         let dst = USER_CODE_ADDR as *mut u8;
-        core::ptr::copy_nonoverlapping(src, dst, program::COPY_LEN);
+        core::ptr::copy_nonoverlapping(program_addr, dst, copy_len);
     }
 
     let read_exec_code_flags = PageTableFlags::PRESENT | PageTableFlags::USER_ACCESSIBLE;
@@ -70,6 +76,38 @@ pub fn setup() -> (VirtAddr, VirtAddr) {
     });
 
     (VirtAddr::new(USER_CODE_ADDR), VirtAddr::new(USER_STACK_TOP))
+}
+
+/// Maps the user code and stack pages and copies the M6 demo program's
+/// machine code into place. Returns `(entry_point, stack_top)` ready for
+/// `enter_user_mode`.
+pub fn setup() -> (VirtAddr, VirtAddr) {
+    // SAFETY: `program::user_entry`'s own doc comment guarantees the
+    // first `COPY_LEN` bytes from its address are safe to read (kernel
+    // .text, at least that many bytes of valid surrounding code).
+    let src = program::user_entry as *const () as *const u8;
+    map_program(src, program::COPY_LEN)
+}
+
+/// Maps the user code and stack pages for the interactive shell, copies
+/// `shell_program::shell_entry`'s machine code into place, and maps its
+/// line-read buffer as a writable, non-executable user page. Returns
+/// `(entry_point, stack_top)` ready for `enter_user_mode`.
+pub fn setup_shell() -> (VirtAddr, VirtAddr) {
+    // SAFETY: `shell_program::shell_entry`'s own doc comment guarantees
+    // the first `COPY_LEN` bytes from its address are safe to read.
+    let src = shell_program::shell_entry as *const () as *const u8;
+    let result = map_program(src, shell_program::COPY_LEN);
+
+    let buf_page: Page<Size4KiB> =
+        Page::containing_address(VirtAddr::new(shell_program::BUF_ADDR));
+    let buf_flags = PageTableFlags::PRESENT
+        | PageTableFlags::WRITABLE
+        | PageTableFlags::USER_ACCESSIBLE
+        | PageTableFlags::NO_EXECUTE;
+    map_page(buf_page, buf_flags).expect("failed to map shell line buffer page");
+
+    result
 }
 
 /// Transitions from ring 0 to ring 3 at `entry`, with `stack_top` as the

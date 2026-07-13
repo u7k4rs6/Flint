@@ -19,6 +19,7 @@ pub mod memory;
 pub mod task;
 pub mod syscall;
 pub mod user;
+pub mod shell;
 
 use core::panic::PanicInfo;
 

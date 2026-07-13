@@ -18,6 +18,8 @@ use x86_64::VirtAddr;
 
 pub const SYS_WRITE: u64 = 1;
 pub const SYS_EXIT: u64 = 2;
+pub const SYS_READ_LINE: u64 = 3;
+pub const SYS_SHELL_DISPATCH: u64 = 4;
 
 /// Sentinel returned to ring 3 in `rax` when a syscall is rejected. Not
 /// zero (a plausible "0 bytes written" success value), and not a value a
@@ -41,10 +43,12 @@ pub fn register(idt: &mut InterruptDescriptorTable) {
 }
 
 /// Validates that `[addr, addr + len)` is entirely within user space:
-/// every page in the range is mapped, and every page is user-accessible.
-/// Bounds and overflow-checks the range before it is used for anything,
-/// per Doc 3 section 4. Never dereferences `addr` itself.
-fn validate_user_range(addr: u64, len: u64) -> Result<(), ()> {
+/// every page in the range is mapped, every page is user-accessible, and
+/// (when `require_writable`, for a syscall about to copy data *to* the
+/// caller, like `SYS_READ_LINE`) every page is writable too. Bounds and
+/// overflow-checks the range before it is used for anything, per Doc 3
+/// section 4. Never dereferences `addr` itself.
+fn validate_user_range(addr: u64, len: u64, require_writable: bool) -> Result<(), ()> {
     if len == 0 {
         return Ok(());
     }
@@ -52,11 +56,16 @@ fn validate_user_range(addr: u64, len: u64) -> Result<(), ()> {
     let start_page = Page::<Size4KiB>::containing_address(VirtAddr::new(addr));
     let end_page = Page::<Size4KiB>::containing_address(VirtAddr::new(end - 1));
 
+    let mut required = PageTableFlags::PRESENT | PageTableFlags::USER_ACCESSIBLE;
+    if require_writable {
+        required |= PageTableFlags::WRITABLE;
+    }
+
     crate::memory::paging::with_mapper(|mapper| {
         for page in Page::range_inclusive(start_page, end_page) {
             match mapper.translate(page.start_address()) {
                 TranslateResult::Mapped { flags, .. } => {
-                    if !flags.contains(PageTableFlags::PRESENT | PageTableFlags::USER_ACCESSIBLE) {
+                    if !flags.contains(required) {
                         return Err(());
                     }
                 }
@@ -72,7 +81,7 @@ fn sys_write(ptr: u64, len: u64) -> u64 {
         crate::serial_println!("[syscall] SYS_WRITE rejected: length {} exceeds max", len);
         return SYSCALL_ERROR;
     }
-    if validate_user_range(ptr, len).is_err() {
+    if validate_user_range(ptr, len, false).is_err() {
         crate::serial_println!(
             "[syscall] SYS_WRITE rejected: pointer {:#x} len {} is not a valid user range",
             ptr,
@@ -92,6 +101,132 @@ fn sys_write(ptr: u64, len: u64) -> u64 {
         Err(_) => crate::serial_println!("[user] <{} non-utf8 bytes>", len),
     }
     len
+}
+
+const MAX_LINE_LEN: u64 = 1024;
+
+type InputByteFn = fn() -> u8;
+
+fn default_input_byte() -> u8 {
+    crate::serial::SERIAL1.lock().receive()
+}
+
+static INPUT_SOURCE: spin::Mutex<InputByteFn> = spin::Mutex::new(default_input_byte);
+static SCRIPTED_INPUT: spin::Mutex<&'static [u8]> = spin::Mutex::new(b"");
+
+fn scripted_input_byte() -> u8 {
+    let mut remaining = SCRIPTED_INPUT.lock();
+    match remaining.split_first() {
+        Some((&byte, rest)) => {
+            *remaining = rest;
+            byte
+        }
+        // Scripted input exhausted with no trailing line ending: report a
+        // line ending rather than spin forever with an empty buffer.
+        None => b'\n',
+    }
+}
+
+/// Makes `SYS_READ_LINE` pull bytes from `bytes` instead of the real UART.
+/// Exists so a test can drive the exact same ring-3/syscall/echo/dispatch
+/// pipeline a human typing at a real terminal would, without depending on
+/// external process stdin actually reaching this QEMU instance (which,
+/// while it does work -- see DECISIONS.md -- would make a bare
+/// `cargo test` hang and fail on this test whenever nothing happens to be
+/// piped into it).
+pub fn set_scripted_input(bytes: &'static [u8]) {
+    *SCRIPTED_INPUT.lock() = bytes;
+    *INPUT_SOURCE.lock() = scripted_input_byte;
+}
+
+/// Blocks (busy-waiting on the UART's own status register, not a CPU
+/// spin) reading bytes until a line ending or `cap` is reached, echoing
+/// each accepted byte back over serial as it arrives -- Doc 2 section 8's
+/// "reads input over serial through a syscall [and] echoes it." Writes
+/// into the caller's buffer only after validating it as a writable user
+/// range (the copy-out half of the checked copy pattern Doc 3 section 4
+/// requires; `SYS_WRITE` above only ever exercised copy-in).
+///
+/// Runs with interrupts disabled for its whole (potentially long, human
+/// typing speed) duration, since `int 0x80` uses an interrupt gate: the
+/// timer and scheduler are effectively paused while waiting for a line.
+/// Acceptable for a single foreground interactive shell (M7's actual
+/// scope); a real implementation would re-enable interrupts around the
+/// blocking wait. See DECISIONS.md.
+fn sys_read_line(ptr: u64, cap: u64) -> u64 {
+    if cap == 0 || cap > MAX_LINE_LEN {
+        crate::serial_println!("[syscall] SYS_READ_LINE rejected: bad capacity {}", cap);
+        return SYSCALL_ERROR;
+    }
+    if validate_user_range(ptr, cap, true).is_err() {
+        crate::serial_println!(
+            "[syscall] SYS_READ_LINE rejected: buffer {:#x} cap {} is not a valid writable user range",
+            ptr,
+            cap
+        );
+        return SYSCALL_ERROR;
+    }
+
+    let mut len: u64 = 0;
+    loop {
+        let read_byte: InputByteFn = *INPUT_SOURCE.lock();
+        let byte = read_byte();
+        if byte == b'\r' || byte == b'\n' {
+            crate::serial::SERIAL1.lock().send(b'\n');
+            break;
+        }
+        if len < cap {
+            // SAFETY: validate_user_range confirmed [ptr, ptr + cap) is
+            // mapped, user-accessible, and writable; len < cap keeps this
+            // write inside that validated range.
+            unsafe { ((ptr + len) as *mut u8).write(byte) };
+            crate::serial::SERIAL1.lock().send(byte);
+            len += 1;
+        }
+        // Bytes beyond `cap` are still consumed (so the line ending is
+        // found and the terminal's own echo stays in sync) but dropped.
+    }
+    len
+}
+
+fn sys_shell_dispatch(ptr: u64, len: u64) -> u64 {
+    if len > MAX_LINE_LEN {
+        crate::serial_println!("[syscall] SYS_SHELL_DISPATCH rejected: length {} exceeds max", len);
+        return SYSCALL_ERROR;
+    }
+    if validate_user_range(ptr, len, false).is_err() {
+        crate::serial_println!(
+            "[syscall] SYS_SHELL_DISPATCH rejected: pointer {:#x} len {} is not a valid user range",
+            ptr,
+            len
+        );
+        return SYSCALL_ERROR;
+    }
+
+    // SAFETY: same reasoning as `sys_write`'s copy-in.
+    let bytes = unsafe { core::slice::from_raw_parts(ptr as *const u8, len as usize) };
+    let line = match core::str::from_utf8(bytes) {
+        Ok(s) => s,
+        Err(_) => {
+            crate::serial_println!("[shell] <non-utf8 input ignored>");
+            return 0;
+        }
+    };
+
+    // exit/quit end the ring-3 loop; signaled back to it (rax == 1) rather
+    // than handled here, since only the ring-3 process itself can decide
+    // to issue its own SYS_EXIT -- the kernel does not tear down tasks it
+    // did not start tearing down (see DECISIONS.md).
+    if line.trim() == "exit" || line.trim() == "quit" {
+        crate::serial_println!("bye");
+        return 1;
+    }
+
+    let response = crate::shell::dispatch(line);
+    if !response.is_empty() {
+        crate::serial_println!("{}", response);
+    }
+    0
 }
 
 type ExitHook = fn() -> !;
@@ -125,6 +260,8 @@ extern "C" fn syscall_dispatch(num: u64, arg1: u64, arg2: u64) -> u64 {
     match num {
         SYS_WRITE => sys_write(arg1, arg2),
         SYS_EXIT => sys_exit(),
+        SYS_READ_LINE => sys_read_line(arg1, arg2),
+        SYS_SHELL_DISPATCH => sys_shell_dispatch(arg1, arg2),
         _ => {
             crate::serial_println!("[syscall] rejected unknown syscall number {}", num);
             SYSCALL_ERROR
