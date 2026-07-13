@@ -17,6 +17,24 @@ just what the code does.
   IOAPIC path. APIC is the natural extension once SMP is in scope (out of
   scope for v1 per Doc 3 section 6.4).
 
+## Context switch (M5)
+
+See the module doc comment in `src/task/context.rs` for the full writeup;
+summary: O(1) -- a fixed sequence of register saves and restores, no loop,
+no allocation, no TLB flush (every task shares the kernel's one CR3 for
+now; that cost arrives with per-process address spaces in M6). The
+alternative Doc 2 section 6.2 gives is "load its CR3 to change the
+address space," which is a real but bounded additional cost that only
+applies once a switch also changes which address space is active.
+
+## Scheduler pick (M5)
+
+See the module doc comment in `src/task/scheduler.rs`; summary: O(1),
+popping the front of a plain ring used as a FIFO. The alternative is
+per-priority ready queues (O(1) pick within a level, but a structure per
+level and starvation questions to answer), left for a later extension
+since v1 treats every task as equally important.
+
 ## Page map / unmap (M4)
 
 See the module doc comment in `src/memory/paging.rs` for the full writeup;

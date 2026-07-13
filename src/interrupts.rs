@@ -71,6 +71,27 @@ pub fn init_idt() {
     IDT.load();
 }
 
+const PIT_FREQUENCY_HZ: u32 = 1_193_182;
+
+/// Reprograms PIT channel 0 (the source of IRQ0) from its BIOS default of
+/// ~18.2 Hz to `hz`, so the scheduler has a known, reasonably fine-grained
+/// tick period instead of whatever the firmware happened to leave it at.
+pub fn init_pit(hz: u32) {
+    let divisor = (PIT_FREQUENCY_HZ / hz) as u16;
+    let mut command: Port<u8> = Port::new(0x43);
+    let mut channel0: Port<u8> = Port::new(0x40);
+    // SAFETY: 0x43/0x40 are the standard 8253/8254 PIT command and
+    // channel-0 data ports; this sequence (command byte, then low byte,
+    // then high byte of the reload value) is the documented way to
+    // reprogram channel 0's rate, and nothing else in the kernel touches
+    // these ports.
+    unsafe {
+        command.write(0x36u8); // channel 0, lobyte/hibyte access, mode 3 (square wave)
+        channel0.write((divisor & 0xff) as u8);
+        channel0.write((divisor >> 8) as u8);
+    }
+}
+
 extern "x86-interrupt" fn breakpoint_handler(stack_frame: InterruptStackFrame) {
     serial_println!("EXCEPTION: BREAKPOINT\n{:#?}", stack_frame);
 }
@@ -140,13 +161,20 @@ extern "x86-interrupt" fn general_protection_fault_handler(
 extern "x86-interrupt" fn timer_interrupt_handler(_stack_frame: InterruptStackFrame) {
     TICKS.fetch_add(1, Ordering::Relaxed);
 
+    // The EOI must go out *before* a possible context switch below: a
+    // switch may not return here for a long time (not until this exact
+    // task is scheduled again), and the PIC will not deliver another IRQ0
+    // (or anything at equal/lower priority) until it sees the EOI for this
+    // one.
+    //
     // SAFETY: this vector is only ever reached via the PIC's timer IRQ, so
-    // acknowledging exactly that vector is correct; the PIC requires an EOI
-    // after every IRQ it delivers or it will stop delivering further ones.
+    // acknowledging exactly that vector is correct.
     unsafe {
         PICS.lock()
             .notify_end_of_interrupt(InterruptIndex::Timer.as_u8());
     }
+
+    crate::task::scheduler::timer_tick();
 }
 
 extern "x86-interrupt" fn keyboard_interrupt_handler(_stack_frame: InterruptStackFrame) {

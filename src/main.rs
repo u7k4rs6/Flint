@@ -17,6 +17,7 @@ entry_point!(kmain);
 fn kmain(boot_info: &'static BootInfo) -> ! {
     flint::init();
     flint::init_memory(boot_info);
+    flint::init_scheduler();
 
     serial_println!("Flint kernel booting...");
     serial_println!("Flint v{} -- boot OK", env!("CARGO_PKG_VERSION"));

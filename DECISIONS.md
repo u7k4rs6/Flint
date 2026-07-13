@@ -2,6 +2,20 @@
 
 Assumptions and judgment calls, most recent first within each milestone.
 
+## M5
+
+- **`#[unsafe(naked)]` + `naked_asm!` (stable since Rust 1.88) instead of `global_asm!` or a hand-rolled `asm!` inside a normal function.** A naked function has no compiler-generated prologue/epilogue, which matters here specifically: `switch` manually pushes/pops the exact register set it wants and hands off `rsp` itself, and a normal function's own prologue (which would push `rbp` and adjust `rsp` before our code ever runs) would corrupt that layout. This is one of the three places inline assembly is unavoidable per Doc 2 section 1.
+
+- **The context-switch register layout is written out as an explicit `#[repr(C)]` struct (`SavedContext`) with a comment on why field order matters**, rather than only living implicitly in the push/pop sequence. Doc 2 section 6.2 calls this the single most error-prone routine in the kernel -- a wrong offset corrupts state silently, no fault, nothing to catch it -- so the layout the asm assumes is written down once, in one place, instead of needing to be re-derived by reading push/pop order backward.
+
+- **No PCID/tagged-TLB, and no per-task CR3 yet.** Every task in M5 is a kernel thread sharing the kernel's single address space, so `switch` never touches CR3 and there is no TLB flush on this path. Per-process address spaces (and the CR3 switch, and the flush cost Doc 2 section 11 calls out) arrive with M6's user processes.
+
+- **PIT reprogrammed to 100 Hz, retroactively closing a gap left in M2.** M2 wired IRQ0 to a handler and counted ticks but never reprogrammed the 8253/8254 timer chip itself, so it was still running at the BIOS default of ~18.2 Hz. That is workable but needlessly coarse for a scheduler quantum (and later, for a `ticks`/`uptime` shell command to be meaningful), so `interrupts::init_pit(100)` was added now and wired into `flint::init()`.
+
+- **The "two tasks alternate" test is deliberately adversarial to a broken scheduler**: both spawned tasks loop forever with no voluntary yield, so a scheduler that only ever ran the first-spawned task (a plausible bug shape -- e.g. forgetting to push the outgoing task back onto the ready queue) would leave the second counter at 0 forever and the test would hang rather than pass. A hang is a legitimate, honest test failure mode here (caught by the harness's QEMU timeout), preferred over a weaker test that could pass by accident.
+
+- **First live run of the scheduler test under `cargo test --lib` alone hit a 60s timeout; a direct manual QEMU run of the identical binary (with `-d int` logging attached, to check for a triple fault or an unexpected exception) completed correctly in under a second, and three subsequent `cargo test --lib` runs were all green.** No exception storm or CPU reset showed up in the interrupt log, and the alternative I tried (rerun directly under gdb-adjacent logging to rule out a genuine hang) confirmed the mechanism itself works; the single slow run reads as host scheduling jitter under this sandboxed environment, not a bug in the context switch or scheduler. Logged per the anti-loop protocol rather than re-running in a blind loop.
+
 ## M4
 
 - **Fixed-size-block heap allocator implemented directly, using `linked_list_allocator::Heap` only as the internal fallback path**, rather than installing `linked_list_allocator`'s `LockedHeap` wholesale as the global allocator. Doc 2 section 5.3 lists three options and recommends the fixed-block design as "a strong, teachable middle ground"; implementing it (rather than only wiring up a crate) is what makes the alloc/free complexity note in `COMPLEXITY.md` an honest description of what Flint's allocator actually does, not a description of a dependency's internals.

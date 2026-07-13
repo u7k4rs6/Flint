@@ -16,6 +16,7 @@ pub mod qemu;
 pub mod gdt;
 pub mod interrupts;
 pub mod memory;
+pub mod task;
 
 use core::panic::PanicInfo;
 
@@ -32,6 +33,7 @@ pub fn init() {
     // IRQs; PICS.lock().initialize() must run before interrupts::enable()
     // or an IRQ could arrive before the PIC's own remap is complete.
     unsafe { interrupts::PICS.lock().initialize() };
+    interrupts::init_pit(100); // 100 Hz: a 10ms scheduling quantum
     x86_64::instructions::interrupts::enable();
 }
 
@@ -44,6 +46,13 @@ pub fn init_memory(boot_info: &'static bootloader::BootInfo) {
     // this entry point via `entry_point!`, and this runs once during boot
     // before anything could have allocated a frame.
     unsafe { memory::init(&boot_info.memory_map, boot_info.physical_memory_offset) };
+}
+
+/// Starts the scheduler with an empty ready queue. Separate from `init`
+/// because spawning even the placeholder boot task allocates (`Box`), so
+/// this must run after `init_memory` has brought up the heap.
+pub fn init_scheduler() {
+    task::scheduler::init();
 }
 
 /// Spin forever with `hlt` between iterations instead of busy-looping, so an
@@ -103,6 +112,7 @@ entry_point!(test_kernel_main);
 fn test_kernel_main(boot_info: &'static BootInfo) -> ! {
     init();
     init_memory(boot_info);
+    init_scheduler();
     test_main();
     hlt_loop();
 }
