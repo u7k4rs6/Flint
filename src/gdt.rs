@@ -21,6 +21,16 @@ pub const DOUBLE_FAULT_IST_INDEX: u16 = 0;
 
 const STACK_SIZE: usize = 4096 * 5;
 
+/// `[u8; N]` alone has no alignment guarantee beyond 1 byte. The syscall
+/// entry stub (`syscall::syscall_entry`) and the double-fault handler both
+/// eventually `call` into normal Rust code from these stacks, and the
+/// SysV ABI requires 16-byte stack alignment at a call site -- so the
+/// *top* of each of these stacks (what becomes the initial `rsp`) must
+/// itself be 16-byte aligned for that arithmetic to hold.
+#[repr(align(16))]
+#[allow(dead_code)] // only ever addressed via &raw const, never read as a value
+struct AlignedStack([u8; STACK_SIZE]);
+
 lazy_static! {
     static ref TSS: TaskStateSegment = {
         let mut tss = TaskStateSegment::new();
@@ -30,8 +40,22 @@ lazy_static! {
             // is never accessed as a Rust value again afterward -- it exists
             // purely to reserve backing memory for the stack the CPU will
             // switch `rsp` to on IST entry.
-            static mut DOUBLE_FAULT_STACK: [u8; STACK_SIZE] = [0; STACK_SIZE];
+            static mut DOUBLE_FAULT_STACK: AlignedStack = AlignedStack([0; STACK_SIZE]);
             let stack_start = VirtAddr::from_ptr(&raw const DOUBLE_FAULT_STACK);
+            stack_start + STACK_SIZE as u64
+        };
+        // rsp0: the stack the CPU switches to on any ring 3 -> ring 0
+        // transition (a syscall via `int 0x80`, or any exception/IRQ taken
+        // while running user code). Without this, a privilege-level change
+        // would try to keep using whatever rsp ring 3 had -- a user stack
+        // the kernel cannot trust -- for kernel-mode exception handling.
+        // One static stack is enough for M6 (a single demo user program,
+        // no concurrent user processes yet); a real per-task rsp0 would be
+        // written here by the scheduler on every switch.
+        tss.privilege_stack_table[0] = {
+            // SAFETY: same reasoning as DOUBLE_FAULT_STACK above.
+            static mut PRIVILEGE_STACK: AlignedStack = AlignedStack([0; STACK_SIZE]);
+            let stack_start = VirtAddr::from_ptr(&raw const PRIVILEGE_STACK);
             stack_start + STACK_SIZE as u64
         };
         tss

@@ -17,6 +17,24 @@ just what the code does.
   IOAPIC path. APIC is the natural extension once SMP is in scope (out of
   scope for v1 per Doc 3 section 6.4).
 
+## User-pointer check (M6)
+
+- **Cost:** O(1) range/overflow check plus O(levels) = O(1) per page in
+  the range (a page-table walk via `Translate`), so O(pages-in-range)
+  overall -- one walk per 4 KiB page the syscall argument spans.
+- **Alternative:** cache the validation result for a whole copy span
+  (validate once, trust it for every subsequent access within that
+  syscall), which Doc 2 section 11 lists as the option that trades some
+  safety margin (a validated range could theoretically be remapped
+  between the check and a later use, a classic TOCTOU) for fewer walks on
+  a large multi-page copy.
+- **Tradeoff:** Flint validates the whole range up front and then treats
+  it as trusted only for the remainder of that single syscall invocation
+  (no caching across syscalls, no long-lived "trusted" pointers) -- the
+  safety cost is one walk per page, paid on every syscall that touches a
+  pointer, which is deliberately conservative given this is Doc 3's
+  single most important safety control.
+
 ## Context switch (M5)
 
 See the module doc comment in `src/task/context.rs` for the full writeup;

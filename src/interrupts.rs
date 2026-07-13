@@ -63,6 +63,7 @@ lazy_static! {
         }
         idt[InterruptIndex::Timer.as_u8()].set_handler_fn(timer_interrupt_handler);
         idt[InterruptIndex::Keyboard.as_u8()].set_handler_fn(keyboard_interrupt_handler);
+        crate::syscall::register(&mut idt);
         idt
     };
 }

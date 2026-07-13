@@ -17,6 +17,8 @@ pub mod gdt;
 pub mod interrupts;
 pub mod memory;
 pub mod task;
+pub mod syscall;
+pub mod user;
 
 use core::panic::PanicInfo;
 

@@ -36,6 +36,10 @@ harness = false
 name = "null_page"
 harness = false
 
+[[test]]
+name = "user_mode"
+harness = false
+
 [package.metadata.bootimage]
 run-args = [
   "-device", "isa-debug-exit,iobase=0xf4,iosize=0x04",
