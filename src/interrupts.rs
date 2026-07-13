@@ -90,7 +90,8 @@ extern "x86-interrupt" fn page_fault_handler(
     stack_frame: InterruptStackFrame,
     error_code: PageFaultErrorCode,
 ) {
-    let accessed_address = x86_64::registers::control::Cr2::read();
+    let accessed_address =
+        x86_64::registers::control::Cr2::read().expect("CR2 held a non-canonical address");
 
     if error_code.contains(PageFaultErrorCode::USER_MODE) {
         // A page fault from ring 3 is a user-process error, not a kernel
@@ -104,6 +105,20 @@ extern "x86-interrupt" fn page_fault_handler(
             stack_frame
         );
         return;
+    }
+
+    // A not-present fault (no PROTECTION_VIOLATION bit) inside the lazy
+    // region is demand paging working as designed (Doc 2 section 5.2): map
+    // a fresh frame and let the faulting instruction re-run. Anything else
+    // -- a protection violation, or a not-present fault outside the lazy
+    // region -- is a genuine kernel bug and must panic loudly rather than
+    // paper over corrupt control flow.
+    if !error_code.contains(PageFaultErrorCode::PROTECTION_VIOLATION)
+        && crate::memory::paging::is_lazy_region(accessed_address)
+    {
+        if crate::memory::paging::demand_page(accessed_address).is_ok() {
+            return;
+        }
     }
 
     panic!(

@@ -1,7 +1,8 @@
-//! Physical memory management. Paging and the kernel heap (M4) are layered
-//! on top of the frame allocator here.
+//! Physical memory management, paging, and the kernel heap.
 
 pub mod frame;
+pub mod heap;
+pub mod paging;
 
 use bootloader::bootinfo::MemoryMap;
 use frame::BootFrameAllocator;
@@ -10,17 +11,27 @@ use x86_64::VirtAddr;
 
 static FRAME_ALLOCATOR: Mutex<Option<BootFrameAllocator>> = Mutex::new(None);
 
-/// Brings up the physical frame allocator from the bootloader's memory map.
+/// Brings up physical memory end to end: the frame allocator, the page
+/// table mapper, and the kernel heap, in that dependency order (paging
+/// needs frames to allocate page tables into; the heap needs paging to map
+/// its virtual range).
 ///
 /// # Safety
 /// Must be called exactly once, early in boot, with the genuine `BootInfo`
-/// the bootloader handed the kernel (see `BootFrameAllocator::init`'s
-/// contract, which this forwards).
+/// the bootloader handed the kernel (see `BootFrameAllocator::init` and
+/// `paging::init`, whose contracts this forwards).
 pub unsafe fn init(memory_map: &MemoryMap, physical_memory_offset: u64) {
     let phys_mem_offset = VirtAddr::new(physical_memory_offset);
+
     // SAFETY: forwarded to the caller's contract above.
     let allocator = unsafe { BootFrameAllocator::init(memory_map, phys_mem_offset) };
     *FRAME_ALLOCATOR.lock() = Some(allocator);
+
+    // SAFETY: forwarded to the caller's contract above; the frame
+    // allocator this depends on (via `map_page`) was just initialized.
+    unsafe { paging::init(phys_mem_offset) };
+
+    heap::init_heap().expect("kernel heap mapping failed");
 }
 
 /// Runs `f` with exclusive access to the global frame allocator. Panics if

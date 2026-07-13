@@ -32,6 +32,10 @@ features = ["spin_no_std"]
 name = "stack_overflow"
 harness = false
 
+[[test]]
+name = "null_page"
+harness = false
+
 [package.metadata.bootimage]
 run-args = [
   "-device", "isa-debug-exit,iobase=0xf4,iosize=0x04",

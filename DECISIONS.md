@@ -2,6 +2,14 @@
 
 Assumptions and judgment calls, most recent first within each milestone.
 
+## M4
+
+- **Fixed-size-block heap allocator implemented directly, using `linked_list_allocator::Heap` only as the internal fallback path**, rather than installing `linked_list_allocator`'s `LockedHeap` wholesale as the global allocator. Doc 2 section 5.3 lists three options and recommends the fixed-block design as "a strong, teachable middle ground"; implementing it (rather than only wiring up a crate) is what makes the alloc/free complexity note in `COMPLEXITY.md` an honest description of what Flint's allocator actually does, not a description of a dependency's internals.
+
+- **No formal virtual-memory-area (VMA) tracking yet.** The page-fault handler's demand paging only activates inside one explicit, hardcoded "lazy region" (`memory::paging::LAZY_REGION_START/SIZE`) rather than deciding "valid but unmapped" vs "illegal" from a real per-address-space region map. A real kernel needs the latter (e.g. to lazily grow a specific task's stack, or back a specific mmap'd range) but that requires the process/address-space model M5/M6 will introduce. Scoping demand paging to one explicit region now is enough to satisfy and test the PRD's "valid-but-unmapped page fault is handled and execution continues" requirement honestly, without a wild kernel-mode pointer bug getting silently papered over by an overly permissive fault handler in the meantime.
+
+- **`map_page` asserts (not merely documents) that virtual page 0 is never mapped.** Doc 3 section 3's null-page requirement is enforced once, at the single choke point every mapping in the kernel funnels through (the heap, demand paging, and any future user-mode mapping code), rather than left as a convention each call site has to remember.
+
 ## M3
 
 - **Intrusive free-list frame allocator instead of a bitmap or a `Vec`-backed free list.** The frame allocator has to exist *before* the heap does (frame alloc -> paging -> heap is the dependency order), so it cannot use `alloc::Vec` for its own bookkeeping. Threading the free list through the freed frames' own memory (via the bootloader's physical-memory offset mapping) sidesteps that ordering problem entirely and gives O(1) alloc/free with no separate storage, at the cost of every `deallocate_frame` being an unsafe raw write into physical memory. See `COMPLEXITY.md` for the full tradeoff writeup.

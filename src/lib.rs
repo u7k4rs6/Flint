@@ -9,6 +9,8 @@
 #![test_runner(crate::test_runner)]
 #![reexport_test_harness_main = "test_main"]
 
+extern crate alloc;
+
 pub mod serial;
 pub mod qemu;
 pub mod gdt;
