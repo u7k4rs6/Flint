@@ -20,14 +20,15 @@ record, and `files (1)/` for the specs Flint is built against.
 Four commands, and nothing else is required to interact with the project.
 
 - **Build:** `cargo build`
-- **Run:** `cargo run` — boots straight into the interactive shell over
+- **Run:** `cargo run` -- boots straight into the interactive shell over
   serial (try `help`). Runs until you type `exit`, after which the kernel
   halts; Ctrl-C to stop earlier.
-- **Test:** `cargo test` — boots the in-kernel test harness under QEMU;
+- **Test:** `cargo test` -- boots the in-kernel test harness under QEMU;
   each test reports over serial and the run exits with a pass/fail status.
   Run a single integration test with `cargo test --test <name>` (`basic_boot`,
-  `stack_overflow`, `null_page`, `user_mode`, `shell`).
-- **Debug:** `make debug` — builds and launches QEMU halted with its gdb
+  `stack_overflow`, `task_stack_overflow`, `null_page`, `register_dump`,
+  `user_mode`, `shell`).
+- **Debug:** `make debug` -- builds and launches QEMU halted with its gdb
   stub (`-s -S`) and interrupt logging, for the finicky bugs (the context
   switch, the ring-3/syscall boundary). Attach with
   `gdb -ex "target remote :1234"` in another shell once QEMU prints its
