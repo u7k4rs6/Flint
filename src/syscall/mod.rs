@@ -76,26 +76,172 @@ fn validate_user_range(addr: u64, len: u64, require_writable: bool) -> Result<()
     })
 }
 
+// ===== Fault-safe user copies (Doc 3 sections 4, 7; the threat table's
+// "fault mid-copy across the boundary" row) =====
+//
+// `validate_user_range` above closes the gap between "the argument looks
+// like a valid pointer" and "the argument is actually safe to touch," but
+// it is still a check-then-use: nothing stops the mapping it just walked
+// from being revoked before the copy that follows actually runs (a classic
+// TOCTOU window -- see COMPLEXITY.md's user-pointer-check entry). Nothing
+// in Flint revokes a mapping mid-syscall today (single process, single
+// core, interrupts disabled for the whole `int 0x80` body -- see below),
+// but Doc 3 requires the copy path itself handle a fault gracefully and
+// return an error rather than panic, architecturally, not "only if
+// currently reachable."
+//
+// The mechanism: each of `copy_from_user_byte`/`copy_to_user_byte` records
+// (in `RECOVERY_IP`) the address of its own fallthrough label immediately
+// before doing the one instruction that might fault, so `page_fault_handler`
+// (`interrupts.rs`) can recognize "this specific kernel-mode fault happened
+// inside a recoverable copy" and redirect execution there -- via
+// `InterruptStackFrame::as_mut()` rewriting the saved `rip` -- instead of
+// falling through to its normal panic. This is sound as a single global
+// (not per-CPU -- Flint has no SMP, see DECISIONS.md) pair of flags
+// specifically because `int 0x80` runs with interrupts disabled for its
+// entire body (already true today, see `sys_read_line`'s doc comment
+// below): no timer/keyboard IRQ can preempt an in-flight copy and race
+// `RECOVERY_IP`/`COPY_FAULTED`; only the copy's own synchronous fault can
+// touch them, and exceptions aren't gated by IF.
+static RECOVERY_IP: core::sync::atomic::AtomicU64 = core::sync::atomic::AtomicU64::new(0);
+static COPY_FAULTED: core::sync::atomic::AtomicBool = core::sync::atomic::AtomicBool::new(false);
+
+/// Called only from `page_fault_handler`. Atomically reads and clears the
+/// current recovery address: `Some(ip)` means the fault that just happened
+/// is inside a recoverable copy and should redirect to `ip` instead of
+/// panicking; `None` means it's a genuine kernel bug.
+pub(crate) fn take_copy_recovery_ip() -> Option<u64> {
+    let ip = RECOVERY_IP.swap(0, core::sync::atomic::Ordering::Relaxed);
+    if ip == 0 {
+        None
+    } else {
+        Some(ip)
+    }
+}
+
+/// Called only from `page_fault_handler`, immediately before redirecting to
+/// the address `take_copy_recovery_ip` returned -- tells the waiting
+/// `copy_from_user_byte`/`copy_to_user_byte` call that its access faulted,
+/// so it returns `Err` instead of treating whatever garbage ended up in its
+/// output register as real data.
+pub(crate) fn mark_copy_faulted() {
+    COPY_FAULTED.store(true, core::sync::atomic::Ordering::Relaxed);
+}
+
+/// Reads one byte from a user address that `validate_user_range` has
+/// already approved, but treats the read itself as still capable of
+/// faulting (the TOCTOU window above) rather than trusting the earlier
+/// check unconditionally. `#[inline(never)]` so the `2f` label inside the
+/// asm block below names a stable, unique address `page_fault_handler` can
+/// redirect to -- inlining could duplicate or relocate it unpredictably.
+#[inline(never)]
+fn copy_from_user_byte(ptr: u64) -> Result<u8, ()> {
+    COPY_FAULTED.store(false, core::sync::atomic::Ordering::Relaxed);
+    let recovery_slot = &RECOVERY_IP as *const core::sync::atomic::AtomicU64 as u64;
+    let value: u64;
+    // SAFETY: `ptr` was already range/mapped/user-accessible-checked by
+    // this call's caller via `validate_user_range`; if the mapping was
+    // revoked in the (currently unreachable, but architecturally possible)
+    // window between that check and this read, the resulting page fault is
+    // caught by `page_fault_handler`'s `take_copy_recovery_ip` check
+    // (wired up specifically for this address range) rather than
+    // dereferencing further or corrupting kernel state -- `movzx` either
+    // completes and leaves a real byte in `{out}`, or never completes and
+    // execution resumes at `2:` with `{out}` left undefined, which is why
+    // the caller only trusts `value` when `COPY_FAULTED` is false.
+    unsafe {
+        core::arch::asm!(
+            "lea {tmp}, [rip + 2f]",
+            "mov qword ptr [{slot}], {tmp}",
+            "movzx {out}, byte ptr [{ptr}]",
+            "2:",
+            tmp = out(reg) _,
+            slot = in(reg) recovery_slot,
+            out = out(reg) value,
+            ptr = in(reg) ptr,
+            options(nostack),
+        );
+    }
+    // Idempotent on the fault path (the handler already cleared it as part
+    // of the redirect) and necessary on the success path (nothing else
+    // would clear a stale recovery address before the *next* unrelated
+    // fault, kernel or otherwise, could be misattributed to this copy).
+    RECOVERY_IP.store(0, core::sync::atomic::Ordering::Relaxed);
+    if COPY_FAULTED.load(core::sync::atomic::Ordering::Relaxed) {
+        Err(())
+    } else {
+        Ok(value as u8)
+    }
+}
+
+/// Writes one byte to a user address `validate_user_range` has already
+/// approved as writable, with the same fault-recovery discipline as
+/// `copy_from_user_byte`.
+#[inline(never)]
+fn copy_to_user_byte(ptr: u64, val: u8) -> Result<(), ()> {
+    COPY_FAULTED.store(false, core::sync::atomic::Ordering::Relaxed);
+    let recovery_slot = &RECOVERY_IP as *const core::sync::atomic::AtomicU64 as u64;
+    // SAFETY: same reasoning as `copy_from_user_byte`, for the write
+    // direction -- `validate_user_range(..., require_writable: true)` is
+    // this call's caller's contract.
+    unsafe {
+        core::arch::asm!(
+            "lea {tmp}, [rip + 2f]",
+            "mov qword ptr [{slot}], {tmp}",
+            "mov byte ptr [{ptr}], {val}",
+            "2:",
+            tmp = out(reg) _,
+            slot = in(reg) recovery_slot,
+            ptr = in(reg) ptr,
+            val = in(reg_byte) val,
+            options(nostack),
+        );
+    }
+    RECOVERY_IP.store(0, core::sync::atomic::Ordering::Relaxed);
+    if COPY_FAULTED.load(core::sync::atomic::Ordering::Relaxed) {
+        Err(())
+    } else {
+        Ok(())
+    }
+}
+
 fn sys_write(ptr: u64, len: u64) -> u64 {
     if len > MAX_WRITE_LEN {
-        crate::serial_println!("[syscall] SYS_WRITE rejected: length {} exceeds max", len);
+        crate::log_warn!("SYS_WRITE rejected: length {} exceeds max", len);
         return SYSCALL_ERROR;
     }
     if validate_user_range(ptr, len, false).is_err() {
-        crate::serial_println!(
-            "[syscall] SYS_WRITE rejected: pointer {:#x} len {} is not a valid user range",
+        crate::log_warn!(
+            "SYS_WRITE rejected: pointer {:#x} len {} is not a valid user range",
             ptr,
             len
         );
         return SYSCALL_ERROR;
     }
 
-    // SAFETY: `validate_user_range` just confirmed every page in
-    // `[ptr, ptr + len)` is present and user-accessible, and `len` is
-    // bounded above by `MAX_WRITE_LEN`, so this reads only memory the
-    // calling user program was actually granted -- the copy-in half of
-    // the checked copy-in/copy-out pattern Doc 3 section 4 requires.
-    let bytes = unsafe { core::slice::from_raw_parts(ptr as *const u8, len as usize) };
+    // `validate_user_range` just confirmed every page in `[ptr, ptr + len)`
+    // is present and user-accessible, but the copy itself still goes
+    // through `copy_from_user_byte` rather than a bulk, unchecked read --
+    // the copy-in half of the checked copy-in/copy-out pattern Doc 3
+    // section 4 requires, fault-safe against the mapping being revoked in
+    // the window between that check and this loop. `len` is already
+    // bounded by `MAX_WRITE_LEN` above, so a fixed-size kernel buffer
+    // covers every valid call.
+    let mut buf = [0u8; MAX_WRITE_LEN as usize];
+    for (i, slot) in buf.iter_mut().enumerate().take(len as usize) {
+        match copy_from_user_byte(ptr + i as u64) {
+            Ok(byte) => *slot = byte,
+            Err(()) => {
+                crate::log_warn!(
+                    "SYS_WRITE rejected: pointer {:#x} faulted mid-copy at offset {}",
+                    ptr,
+                    i
+                );
+                return SYSCALL_ERROR;
+            }
+        }
+    }
+    let bytes = &buf[..len as usize];
     match core::str::from_utf8(bytes) {
         Ok(s) => crate::serial_println!("[user] {}", s),
         Err(_) => crate::serial_println!("[user] <{} non-utf8 bytes>", len),
@@ -155,12 +301,12 @@ pub fn set_scripted_input(bytes: &'static [u8]) {
 /// blocking wait. See DECISIONS.md.
 fn sys_read_line(ptr: u64, cap: u64) -> u64 {
     if cap == 0 || cap > MAX_LINE_LEN {
-        crate::serial_println!("[syscall] SYS_READ_LINE rejected: bad capacity {}", cap);
+        crate::log_warn!("SYS_READ_LINE rejected: bad capacity {}", cap);
         return SYSCALL_ERROR;
     }
     if validate_user_range(ptr, cap, true).is_err() {
-        crate::serial_println!(
-            "[syscall] SYS_READ_LINE rejected: buffer {:#x} cap {} is not a valid writable user range",
+        crate::log_warn!(
+            "SYS_READ_LINE rejected: buffer {:#x} cap {} is not a valid writable user range",
             ptr,
             cap
         );
@@ -176,10 +322,20 @@ fn sys_read_line(ptr: u64, cap: u64) -> u64 {
             break;
         }
         if len < cap {
-            // SAFETY: validate_user_range confirmed [ptr, ptr + cap) is
-            // mapped, user-accessible, and writable; len < cap keeps this
-            // write inside that validated range.
-            unsafe { ((ptr + len) as *mut u8).write(byte) };
+            // `validate_user_range` confirmed `[ptr, ptr + cap)` is mapped,
+            // user-accessible, and writable, and `len < cap` keeps this
+            // write inside that validated range -- but the write itself
+            // still goes through `copy_to_user_byte` rather than a raw
+            // pointer write, fault-safe against the mapping being revoked
+            // since the check (Doc 3 section 4's copy-out half).
+            if copy_to_user_byte(ptr + len, byte).is_err() {
+                crate::log_warn!(
+                    "SYS_READ_LINE rejected: buffer {:#x} faulted mid-copy at offset {}",
+                    ptr,
+                    len
+                );
+                return SYSCALL_ERROR;
+            }
             crate::serial::SERIAL1.lock().send(byte);
             len += 1;
         }
@@ -191,24 +347,39 @@ fn sys_read_line(ptr: u64, cap: u64) -> u64 {
 
 fn sys_shell_dispatch(ptr: u64, len: u64) -> u64 {
     if len > MAX_LINE_LEN {
-        crate::serial_println!("[syscall] SYS_SHELL_DISPATCH rejected: length {} exceeds max", len);
+        crate::log_warn!("SYS_SHELL_DISPATCH rejected: length {} exceeds max", len);
         return SYSCALL_ERROR;
     }
     if validate_user_range(ptr, len, false).is_err() {
-        crate::serial_println!(
-            "[syscall] SYS_SHELL_DISPATCH rejected: pointer {:#x} len {} is not a valid user range",
+        crate::log_warn!(
+            "SYS_SHELL_DISPATCH rejected: pointer {:#x} len {} is not a valid user range",
             ptr,
             len
         );
         return SYSCALL_ERROR;
     }
 
-    // SAFETY: same reasoning as `sys_write`'s copy-in.
-    let bytes = unsafe { core::slice::from_raw_parts(ptr as *const u8, len as usize) };
+    // Same fault-safe copy-in as `sys_write`; `len` is already bounded by
+    // `MAX_LINE_LEN` above.
+    let mut buf = [0u8; MAX_LINE_LEN as usize];
+    for (i, slot) in buf.iter_mut().enumerate().take(len as usize) {
+        match copy_from_user_byte(ptr + i as u64) {
+            Ok(byte) => *slot = byte,
+            Err(()) => {
+                crate::log_warn!(
+                    "SYS_SHELL_DISPATCH rejected: pointer {:#x} faulted mid-copy at offset {}",
+                    ptr,
+                    i
+                );
+                return SYSCALL_ERROR;
+            }
+        }
+    }
+    let bytes = &buf[..len as usize];
     let line = match core::str::from_utf8(bytes) {
         Ok(s) => s,
         Err(_) => {
-            crate::serial_println!("[shell] <non-utf8 input ignored>");
+            crate::log_warn!("SYS_SHELL_DISPATCH: non-utf8 input ignored");
             return 0;
         }
     };
@@ -249,7 +420,7 @@ pub fn set_exit_hook(hook: ExitHook) {
 
 /// Never returns to the caller: ends the (single, demo) user program.
 fn sys_exit() -> ! {
-    crate::serial_println!("[user] exited via SYS_EXIT");
+    crate::log_info!("exited via SYS_EXIT");
     let hook = *EXIT_HOOK.lock();
     hook()
 }
@@ -263,7 +434,7 @@ extern "C" fn syscall_dispatch(num: u64, arg1: u64, arg2: u64) -> u64 {
         SYS_READ_LINE => sys_read_line(arg1, arg2),
         SYS_SHELL_DISPATCH => sys_shell_dispatch(arg1, arg2),
         _ => {
-            crate::serial_println!("[syscall] rejected unknown syscall number {}", num);
+            crate::log_warn!("rejected unknown syscall number {}", num);
             SYSCALL_ERROR
         }
     }
@@ -302,4 +473,55 @@ unsafe extern "C" fn syscall_entry() {
         "iretq",
         dispatch = sym syscall_dispatch,
     )
+}
+
+#[cfg(test)]
+mod tests {
+    use super::{copy_from_user_byte, copy_to_user_byte};
+    use x86_64::structures::paging::{Page, PageTableFlags, Size4KiB};
+    use x86_64::VirtAddr;
+
+    /// Doc 3 sections 4/7's "a copy path that catches a mid-copy fault and
+    /// returns an error rather than panicking" gate. Maps a page the same
+    /// way a validated user pointer would look (present, user-accessible,
+    /// writable), then deliberately unmaps it -- the TOCTOU window Doc 3
+    /// requires a copy to survive, since nothing in Flint's normal
+    /// operation ever does this on its own -- and proves
+    /// `copy_from_user_byte`/`copy_to_user_byte` return `Err` instead of
+    /// taking the kernel down with a page fault. Reaching the assertions
+    /// *at all* is itself part of the proof: before this mechanism existed,
+    /// the second `copy_from_user_byte` call below would have panicked the
+    /// whole kernel (`page_fault_handler`'s unconditional final `panic!`),
+    /// which would fail this test the same way any other kernel panic
+    /// fails the harness, not return cleanly to this point.
+    #[test_case]
+    fn copy_helpers_return_err_instead_of_panicking_on_a_mid_copy_fault() {
+        const TEST_ADDR: u64 = 0x_7777_7777_0000;
+        let page: Page<Size4KiB> = Page::containing_address(VirtAddr::new(TEST_ADDR));
+        let flags = PageTableFlags::PRESENT
+            | PageTableFlags::WRITABLE
+            | PageTableFlags::USER_ACCESSIBLE
+            | PageTableFlags::NO_EXECUTE;
+        crate::memory::paging::map_page(page, flags).expect("failed to map test page");
+
+        // The happy path, on the still-mapped page: proves the fixup
+        // machinery (recording and clearing a recovery point around every
+        // access) doesn't break a normal, successful copy.
+        assert!(copy_to_user_byte(TEST_ADDR, 0x42).is_ok());
+        assert_eq!(copy_from_user_byte(TEST_ADDR), Ok(0x42));
+
+        // Revoke the mapping -- the TOCTOU window: a pointer that was
+        // valid at `validate_user_range` time no longer is.
+        crate::memory::paging::unmap_page(page).expect("failed to unmap test page");
+
+        assert_eq!(copy_from_user_byte(TEST_ADDR), Err(()));
+        assert_eq!(copy_to_user_byte(TEST_ADDR, 0x43), Err(()));
+
+        // The kernel is still alive, and the mechanism left no stale
+        // global state behind: a later, unrelated copy on a freshly
+        // mapped page still works correctly.
+        crate::memory::paging::map_page(page, flags).expect("failed to remap test page");
+        assert!(copy_to_user_byte(TEST_ADDR, 0x44).is_ok());
+        assert_eq!(copy_from_user_byte(TEST_ADDR), Ok(0x44));
+    }
 }

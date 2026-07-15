@@ -27,30 +27,61 @@ static SCHEDULER: Mutex<Option<Scheduler>> = Mutex::new(None);
 /// for whatever context calls this -- typically the kernel's own boot
 /// thread. Safe to call with no tasks ever spawned: `timer_tick` is then
 /// simply a no-op on every tick.
+///
+/// Runs with interrupts disabled for its whole body, like every other
+/// function below that locks `SCHEDULER` from outside an interrupt handler
+/// (`timer_tick` is the one exception -- it's only ever reached *through*
+/// one, where IF is already 0). Without this, a timer tick landing while
+/// this same core holds `SCHEDULER`'s lock would have `timer_tick` spin
+/// forever trying to re-acquire a lock only this now-interrupted code can
+/// release -- a real bug this project hit and fixed, not a hypothetical:
+/// `spawn` below used to be safe only because `Task::new` did negligible
+/// work (a heap alloc); once it started mapping real pages for a guarded
+/// stack (Doc 3 section 3), the critical section grew long enough to
+/// intermittently overlap a 10ms tick, deadlocking `tests/task_stack_overflow.rs`
+/// roughly half the time. See DECISIONS.md.
 pub fn init() {
-    *SCHEDULER.lock() = Some(Scheduler {
-        current: Some(Box::new(Task::placeholder(0, "boot"))),
-        ready_queue: VecDeque::new(),
-        next_id: 1,
-        switches: 0,
+    x86_64::instructions::interrupts::without_interrupts(|| {
+        *SCHEDULER.lock() = Some(Scheduler {
+            current: Some(Box::new(Task::placeholder(0, "boot"))),
+            ready_queue: VecDeque::new(),
+            next_id: 1,
+            switches: 0,
+        });
     });
 }
 
 /// Adds a new task to the ready queue. Returns its id.
 pub fn spawn(name: &'static str, entry: extern "C" fn() -> !) -> TaskId {
-    let mut guard = SCHEDULER.lock();
-    let sched = guard.as_mut().expect("scheduler not initialized");
-    let id = sched.next_id;
-    sched.next_id += 1;
-    sched
-        .ready_queue
-        .push_back(Box::new(Task::new(id, name, entry)));
-    id
+    x86_64::instructions::interrupts::without_interrupts(|| {
+        let mut guard = SCHEDULER.lock();
+        let sched = guard.as_mut().expect("scheduler not initialized");
+        let id = sched.next_id;
+        sched.next_id += 1;
+        sched
+            .ready_queue
+            .push_back(Box::new(Task::new(id, name, entry)));
+        id
+    })
 }
 
 pub fn switch_count() -> u64 {
-    let guard = SCHEDULER.lock();
-    guard.as_ref().map_or(0, |s| s.switches)
+    x86_64::instructions::interrupts::without_interrupts(|| {
+        let guard = SCHEDULER.lock();
+        guard.as_ref().map_or(0, |s| s.switches)
+    })
+}
+
+/// The id of whatever task is currently running, for attributing log lines
+/// and panic reports (Doc 4 section 2/5: "the current task id, so
+/// interleaved output is attributable"). `None` before `scheduler::init`
+/// has run (there is no task yet, current or otherwise) -- callers that log
+/// during that early-boot window just omit the `[task N]` tag.
+pub fn current_task_id() -> Option<TaskId> {
+    x86_64::instructions::interrupts::without_interrupts(|| {
+        let guard = SCHEDULER.lock();
+        guard.as_ref().and_then(|s| s.current.as_ref().map(|t| t.id))
+    })
 }
 
 /// Called from the timer interrupt handler, after it has already

@@ -2,6 +2,235 @@
 
 Assumptions and judgment calls, most recent first within each milestone.
 
+## Doc 2-4 gap closure (post-M7, second pass)
+
+A second audit against Docs 2 (Technical Architecture), 3 (Isolation and
+Privilege), and 4 (Console and CLI Spec) -- the same exercise that produced
+the per-process-address-space addendum below, extended to the other three
+specs -- found eight further gaps between what the docs describe and what
+the M1-M7 build actually shipped. All eight are closed here; none required
+touching the docs themselves.
+
+- **VGA output (`src/vga.rs`) was simply never built in the original M1-M7
+  run**, despite Doc 2 section 3 and PRD FR-OUT-1 naming it the secondary
+  output channel. Added as a straightforward mirror of `serial.rs`'s own
+  `Mutex`+`fmt::Write` pattern, reached through the same physical-memory
+  offset mapping every other physical-address access in Flint already uses
+  (confirmed against the vendored `bootloader` 0.9.35 source that VGA text
+  mode, not `vga_320x200`, is the crate's own default boot-stub setting) --
+  not a raw identity-mapped pointer, since Flint makes no assumption that
+  low physical addresses are identity-mapped into the kernel's own virtual
+  space. Only *key* output (the boot banner, panics) is mirrored to it, per
+  Doc 2 section 3's own "useful for a visible banner and panic, but serial
+  is the workhorse" framing -- not every routine log line, which would mean
+  a VGA write on every syscall.
+
+- **No README, no single-command debug launch.** Doc 4 section 6 explicitly
+  asks for both. A `README.md` documenting exactly the four commands (build/
+  run/test/debug) was added, plus a small `Makefile` `debug` target wrapping
+  the gdb-stub QEMU invocation `SUMMARY.md`/`PROGRESS.md` already documented
+  as hand-typed. The `bootimage` target is intentionally *not* a real Make
+  file-target with a timestamp dependency -- `cargo bootimage` is already
+  incremental and fast when nothing changed, and a file-timestamp-based Make
+  rule would silently skip rebuilding after a source edit, since Make has no
+  visibility into Cargo's own dependency graph.
+
+- **No structured log levels, no task id anywhere in output.** Doc 4 section
+  2 wants every line to carry a level (`trace`/`debug`/`info`/`warn`/
+  `error`) and, once tasks exist, the current task id. A small hand-written
+  macro set (`log_trace!`/`log_debug!`/`log_info!`/`log_warn!`/`log_error!`
+  in `serial.rs`) replaces the ad hoc `[user]`/`[syscall]`/`[shell]` prefixes
+  the original build used, each expanding through a shared `TaskTag` that
+  queries `task::scheduler::current_task_id()` (new) and renders nothing
+  before the scheduler exists, rather than a placeholder task id. Two
+  categories of existing `serial_println!` call were deliberately *not*
+  migrated to a log level: the two-line boot banner and panic headers (kept
+  as plain, VGA-mirrored "key output," a separate concern from routine
+  diagnostics), and a user program's own `SYS_WRITE` effect (`[user] {}` --
+  literally the bytes a ring-3 process asked to write, not a kernel
+  diagnostic, so tagging it with a kernel log level would misrepresent
+  whose output it is).
+
+- **No guard pages for kernel task stacks**, despite Doc 3 section 3 and its
+  own build-time checklist explicitly requiring them. `Task::new` (M5)
+  originally backed every kernel stack with a plain heap `Box<[u8]>` -- no
+  boundary, so an overflow would have silently corrupted adjacent heap
+  memory. Fixed by giving every task stack its own mapped virtual region
+  (via the same `memory::paging::map_page` primitive `heap::init_heap` and
+  `user::map_program` already use) with one page left deliberately unmapped
+  immediately below it, bump-allocated over a reserved PML4-adjacent range
+  (`0x_6666_6666_0000`) never reused -- Flint has no task teardown, so there
+  is nothing to free back into a real allocator yet, a decision inherited
+  from the same "no teardown machinery" gap M6's own addendum below already
+  named for processes. `tests/task_stack_overflow.rs` proves it: spawns a
+  task whose entry recurses forever and confirms the *real* kernel double-
+  fault handler (not a test-local one, since this test needs the timer and
+  scheduler running to reach the task at all, unlike `stack_overflow.rs`)
+  catches the overflow instead of hanging.
+
+  **A real, previously-latent bug surfaced by this change and fixed in the
+  same pass:** `task::scheduler::spawn` holds `SCHEDULER`'s lock across the
+  whole call to `Task::new`, with interrupts enabled -- fine when `Task::new`
+  did negligible work (a heap `alloc`), but once it started calling
+  `map_task_stack` (four real page-table walks), the critical section grew
+  long enough to intermittently overlap a 10ms timer tick. When it did,
+  `timer_tick` (reached through the timer IRQ) tried to re-acquire the same
+  non-reentrant `spin::Mutex` `spawn` was still holding and spun forever --
+  a single-core self-deadlock, since only the interrupted `spawn` call could
+  release it, and it can't run again until the interrupt handler spinning on
+  its lock returns. Manifested as `tests/task_stack_overflow.rs` hanging
+  (QEMU's `test-timeout` killing it) roughly half the time -- diagnosed by
+  bisecting with temporary diagnostic `serial_println!`s at each init stage,
+  which showed the hang always fell between "scheduler initialized" and
+  "task spawned," narrowing it to `spawn`/`Task::new`/`map_task_stack`
+  before landing on the lock-hold-with-interrupts-enabled pattern. Fixed by
+  wrapping `spawn`, `init`, `switch_count`, and `current_task_id` (the
+  latter added in this same pass, and just as exposed) in
+  `x86_64::instructions::interrupts::without_interrupts`, the same
+  discipline `serial::_print` already documents and uses for exactly this
+  reason. Verified with 8 consecutive isolated runs and 3 consecutive full
+  `cargo test` runs, all green, after the fix (both were previously failing
+  at a roughly 25-50% rate across the same number of runs).
+
+- **A syscall's user-pointer copy panicked the kernel on a mid-copy fault**,
+  contradicting Doc 3 sections 4 and 7 and the threat table's explicit
+  requirement that this scenario "return an error rather than panicking."
+  `validate_user_range` closed the "does this pointer look valid" gap but
+  left a TOCTOU window open: nothing stopped the mapping it just walked from
+  being revoked before the actual copy ran (not reachable by anything in
+  Flint today -- single process, single core, interrupts disabled for the
+  whole `int 0x80` body -- but Doc 3 requires the mechanism architecturally,
+  not "only if currently exploitable"). Closed with
+  `copy_from_user_byte`/`copy_to_user_byte` (`syscall/mod.rs`): each records
+  its own fallthrough address in a global `RECOVERY_IP` immediately before
+  the one instruction that might fault, and `page_fault_handler` gets one
+  new check -- if a kernel-mode fault's `RECOVERY_IP` is set, redirect there
+  (via `x86_64` 0.15's `InterruptStackFrame::as_mut()`, confirmed to exist
+  specifically for this) instead of falling through to its panic. Considered
+  and rejected: hand-parsing the CPU-pushed frame to build a from-scratch
+  recovery mechanism -- `as_mut()` already provides exactly the escape hatch
+  needed, no naked stub required for this specific piece (unlike the
+  register-dump addendum below, which needs one for a different reason).
+  Global, not per-CPU/per-task, state is sound specifically because `int
+  0x80` already runs with interrupts disabled for its entire body (a
+  pre-existing invariant, not something newly introduced here) -- no IRQ can
+  preempt an in-flight copy and race the recovery state; only the copy's own
+  synchronous fault can touch it. `sys_write`/`sys_shell_dispatch`'s bulk
+  `slice::from_raw_parts` reads and `sys_read_line`'s raw pointer write were
+  all replaced with bounded byte loops through these helpers.
+  `flint::syscall::tests::copy_helpers_return_err_instead_of_panicking_on_a_mid_copy_fault`
+  proves it directly: validates a range, deliberately unmaps it, and asserts
+  the copy returns `Err` rather than taking the kernel down -- reaching the
+  assertions at all is itself part of the proof, since before this existed
+  the same sequence would have panicked.
+
+- **No register dump in any panic report**, despite Doc 4 section 5 asking
+  for GPRs, the instruction pointer, the stack pointer, and relevant control
+  registers. Confirmed against the vendored `x86_64` 0.15.5 source that
+  `extern "x86-interrupt" fn` bodies cannot see GPRs at all -- LLVM's
+  x86-interrupt calling convention saves and restores whatever it clobbers
+  in a hidden prologue/epilogue never exposed to the handler. Considered and
+  rejected: hand-parsing the CPU-pushed exception frame in a full naked
+  replacement for each handler (real risk of getting the error-code/frame
+  layout subtly wrong -- exactly what `task/context.rs`'s own docs warn
+  "corrupts state silently"). Instead, each of `page_fault_entry`/
+  `general_protection_fault_entry`/`double_fault_entry` (`interrupts.rs`) is
+  a small naked trampoline, generated from one shared `macro_rules!` template
+  so a typo can't silently diverge between the three, that captures GPRs via
+  plain `mov [addr], reg` writes -- no stack or flags touched -- into a set
+  of statics, then `jmp`s straight into the existing, completely unchanged
+  `extern "x86-interrupt" fn` handler. That handler's own compiler-generated
+  frame/error-code parsing does all the real work, untouched; it just also
+  has the captured GPRs available (via a `GprDump` `Display` impl) when it
+  builds its panic message, alongside the current task id
+  (`task::scheduler::current_task_id()`). `breakpoint_handler` was
+  deliberately *not* given a trampoline -- it logs and resumes, never
+  panics, so Doc 4 section 5's "panic report" requirement doesn't apply to
+  it. The generic `#[panic_handler]` (`main.rs`, a plain `panic!()` with no
+  hardware trap frame behind it at all) gets an honestly-labeled best-effort
+  fallback instead: four registers read via inline `asm!` at the top of the
+  handler, documented explicitly as "registers at panic-handler-entry time,
+  not the original `panic!()` call site," since intervening code (formatting
+  the message, reaching that function) may have already reused them.
+  `tests/register_dump.rs` proves the real (trampoline) path with an actual
+  value match, not just "didn't crash": loads a known marker into `rax`,
+  triggers a genuine kernel-mode page fault on a deliberately unmapped
+  canonical address, and asserts the panic report's `rax=` field contains
+  the exact marker. (One accidental but useful confirmation along the way:
+  an earlier draft of that test used a *non-canonical* address by mistake,
+  which triggered a general protection fault instead of a page fault --
+  directly proving the GPF trampoline works too, with an exact register
+  match, before the test was fixed to exercise the page-fault path its name
+  actually claims.)
+
+## M6 addendum -- per-process address spaces (post-M7)
+
+The PRD (Doc 1, Goals and FR-MEM-2/FR-USER-1) calls for a separate address
+space per process. M6's original build shipped without this (see the M6
+section below, "No ELF loader, no per-process address space"), a deliberate
+scope cut at the time. This addendum closes that gap without reopening M6's
+other scope lines (still no ELF loader, still one process per boot).
+
+- **A fresh top-level (PML4) table per process, built by cloning the
+  currently-active one, not a from-scratch table.** `memory::paging::new_address_space`
+  copies all 512 PML4 entries (one 4 KiB page, a single `copy_nonoverlapping`
+  through the physical-memory offset mapping) out of whatever table is
+  active at call time. Kernel-region entries already populated by then (the
+  kernel image, the phys-mem-offset mapping, the heap) end up pointing at
+  the *same* physical PDPT/PD/PT sub-tables as the source, so the kernel
+  stays identically reachable from the new table without walking or
+  re-mapping anything below the top level. Entries not yet populated (the
+  PML4 slots the user code/stack pages use) start absent and get mapped
+  fresh, invisible to any other table -- this is what makes the isolation
+  real rather than cosmetic. Building a table from scratch and re-mapping
+  the kernel into it by hand was rejected: it would require enumerating and
+  re-walking every kernel mapping made so far, redoing work the bootloader
+  and `memory::init` already did once, for no isolation benefit over sharing
+  the same physical sub-tables by reference.
+
+- **A single cached mapper (`paging::MAPPER`), rebuilt once per address-space
+  switch by `paging::activate`, rather than resolving the active table via
+  `Cr3::read()` on every `with_mapper` call.** The alternative (dynamic
+  per-call resolution) was considered and rejected: it would add a
+  raw-pointer-to-`&'static mut PageTable` reconstruction to the hottest path
+  in the kernel -- every syscall's `validate_user_range` call, i.e. every
+  syscall that touches a pointer -- for no benefit, since CR3 changes at
+  most once per boot in every real entry point (`user::setup`/`setup_shell`,
+  called exactly once each). The invariant this relies on, stated explicitly
+  in `paging::activate`'s doc comment: CR3 must only ever be written through
+  `activate`, never directly, or the cached mapper goes stale and silently
+  keeps mutating the table being switched away from.
+
+- **Process creation always clones from the boot table, never from a
+  previously created process's table.** Flint has no fork/exec, and every
+  real call site (`main.rs`, `tests/user_mode.rs`, `tests/shell.rs`) creates
+  exactly one process per boot, always before any process CR3 has ever been
+  activated -- so "the currently active table" at every `new_address_space`
+  call site today is always the boot table. `new_address_space` doesn't
+  special-case or assert this (there is nothing to distinguish "the boot
+  table" from "a process table" at that layer -- both are just "whatever CR3
+  currently is"); it is a scope assumption inherited from Flint having no
+  concept of a second concurrently-running process yet, not a check the code
+  enforces.
+
+- **Accepted limitation, not hit by anything in Flint today: a kernel-region
+  page mapped for the first time while a non-boot table is active would only
+  exist in that one table.** `new_address_space` only shares entries already
+  present in the source table at clone time; a *new* PML4-level entry
+  created afterward (e.g. if the lazy demand-paging region were touched for
+  the first time while a process's table were active) would not retroactively
+  appear in the boot table or in any other process's table. This doesn't
+  affect anything that exists today: the lazy region (`paging::LAZY_REGION_*`)
+  is only ever touched by one dedicated kernel-mode test
+  (`memory::paging::tests::page_fault_on_lazy_region_is_handled_and_continues`),
+  which never activates a process address space, and the page-fault handler
+  returns before reaching `demand_page` at all for a fault taken from ring 3
+  (see `interrupts.rs`'s `USER_MODE` early return). The correct general fix
+  -- pre-populating every kernel-region PDPT entry once at boot, before the
+  first process is ever cloned from it, so no kernel-region PML4 entry is
+  ever created *after* the first clone -- is real, well-understood follow-up
+  work, not attempted here.
+
 ## M7
 
 - **Command parsing lives behind a syscall (`SYS_SHELL_DISPATCH`), in the kernel, not in the ring-3 loop itself.** Doc 2 section 8 frames the shell as "a user-space process, not a kernel feature," and the process-level claim is genuinely true here: the read/dispatch/loop control flow, and the decision to keep running or call its own `SYS_EXIT`, all execute in ring 3. What does not run in ring 3 is the actual string matching for `help`/`echo`/`meminfo`/`ps`/`ticks` -- that would require either an ELF loader (M8 stretch, not attempted) or hand-encoding a real parser directly as raw machine code bytes, which was judged too large a source of new risk for the value it added, this late in an already-long build. Named here as a conscious scope line, matching the same "flat binary, no loader yet" simplification M6 already made for its own demo program.

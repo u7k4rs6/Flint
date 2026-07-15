@@ -39,11 +39,42 @@ just what the code does.
 
 See the module doc comment in `src/task/context.rs` for the full writeup;
 summary: O(1) -- a fixed sequence of register saves and restores, no loop,
-no allocation, no TLB flush (every task shares the kernel's one CR3 for
-now; that cost arrives with per-process address spaces in M6). The
-alternative Doc 2 section 6.2 gives is "load its CR3 to change the
-address space," which is a real but bounded additional cost that only
-applies once a switch also changes which address space is active.
+no allocation, no TLB flush. Kernel threads (the only tasks the scheduler
+ever switches between) still share the kernel's one CR3, so `context::switch`
+itself never touches it. Per-process address spaces (M6 addendum, see below)
+arrived through a separate mechanism -- `paging::activate`, called once when
+a ring-3 process is created, not on every scheduler pick -- because ring-3
+processes are not scheduler `Task`s in Flint (see `src/user/mod.rs`'s module
+doc comment). The alternative Doc 2 section 6.2 gives is "load its CR3 to
+change the address space" as part of the switch itself; that remains a real,
+not-yet-taken extension for a future change that schedules processes as
+`Task`s, not something this addendum adds to the hot switch path.
+
+## Address space creation / activation (M6 addendum)
+
+- **Cost:** O(1) -- `new_address_space` copies a fixed 512 8-byte entries
+  (one 4 KiB page, the whole top-level PML4) regardless of how much memory
+  is mapped underneath; no recursion into lower levels, since kernel-region
+  sub-tables (PDPT/PD/PT) are shared by reference (the same physical frames)
+  rather than deep-copied. `activate` is one `mov cr3, reg`, which
+  architecturally flushes the whole (non-PCID) TLB -- a real but bounded
+  cost, same as Doc 2 section 11 and the M5 entry above anticipated, and
+  incurred once per process created, not once per scheduler tick.
+- **Alternative:** copy each populated `PageTableEntry` through the typed
+  `PageTable` API instead of a raw `u64` `copy_nonoverlapping`.
+- **Tradeoff:** the raw copy is consistent with the frame allocator's own
+  style (`src/memory/frame.rs` already writes free-list links as raw `u64`s
+  through the same physical-memory offset mapping) and needs no
+  `PageTableEntry: Clone` support; a `debug_assert!` right after the copy
+  (matching entry-populated counts between source and destination) is the
+  cheap correctness check in place of leaning on a typed API. The real
+  limitation isn't the copy mechanism, it's timing: only entries already
+  populated in the source table at clone time are shared going forward -- a
+  kernel-region page mapped for the *first* time while a different table is
+  active would only exist in that one table, not retroactively in any
+  earlier clone. Not hit by anything in Flint today (see DECISIONS.md), but
+  the real fix -- pre-populating every kernel-region PDPT entry once at
+  boot, before any process is ever cloned from it -- is future work.
 
 ## Scheduler pick (M5)
 
@@ -129,3 +160,71 @@ section 5.3 recommends.
   dedicated IST stack costs a fixed slab of memory reserved up front, in
   exchange for turning that reset into a catchable, debuggable exception --
   verified directly by `tests/stack_overflow.rs`.
+
+## Kernel task stack allocation (M5 addendum, post-M7)
+
+- **Cost:** O(1) per task -- `task::map_task_stack` bump-allocates the next
+  virtual-address slot (a counter increment, no search) and maps a fixed
+  `STACK_SIZE / 4 KiB` = 4 pages, each an O(1) page-table walk (see "Page
+  map / unmap" above). One guard page is *not* mapped, which costs nothing
+  -- an absence, not an operation.
+- **Alternative:** the original M5 design, a plain heap `Box<[u8]>`
+  (`alloc::vec![0u8; STACK_SIZE].into_boxed_slice()`) -- O(1) via the
+  existing fixed-size-block heap allocator, no page-table walk at all.
+- **Tradeoff:** the heap-backed version is cheaper (no map calls, no
+  virtual-address bookkeeping) but has no boundary: an overflow silently
+  overwrites whatever heap memory happens to sit below it (Doc 3 section 3's
+  gap). The mapped-plus-guard-page version costs 4 page-table walks and a
+  bump-allocated virtual slot per task, in exchange for turning a stack
+  overflow into a catchable double fault (the same IST mechanism Doc 3
+  section 5 already covers) instead of silent corruption -- verified
+  directly by `tests/task_stack_overflow.rs`. Never reused or freed (Flint
+  has no task teardown), so the bump allocator never needs a free list; a
+  real multi-process kernel would need one once tasks can exit.
+
+## Fault-safe user copy (M6 addendum, post-M7)
+
+- **Cost:** O(1) per byte -- `copy_from_user_byte`/`copy_to_user_byte`
+  (`syscall/mod.rs`) are a fixed handful of instructions each (a `lea`, a
+  store to `RECOVERY_IP`, the one risky access), called once per byte in a
+  bounded loop (already bounded by `MAX_WRITE_LEN`/`MAX_LINE_LEN`), so the
+  cost is the same O(pages-in-range) shape "User-pointer check" above
+  already pays, at the granularity of bytes instead of pages.
+- **Alternative:** trust `validate_user_range`'s earlier check unconditionally
+  and do a raw, unchecked copy (`slice::from_raw_parts` / a direct pointer
+  write) -- what Flint did before this addendum.
+- **Tradeoff:** the raw-copy version is faster (no per-byte recovery-point
+  bookkeeping) but has a real TOCTOU gap: a mapping valid at
+  `validate_user_range` time can be revoked before the copy runs, and the
+  resulting kernel-mode page fault would panic the whole kernel (Doc 3
+  section 4's specific requirement this addendum closes). The fault-safe
+  version costs recording and clearing a global recovery pointer around
+  every single-byte access, in exchange for turning that fault into a plain
+  `Err` the syscall returns to its caller -- verified directly by
+  `flint::syscall::tests::copy_helpers_return_err_instead_of_panicking_on_a_mid_copy_fault`,
+  which deliberately unmaps a page mid-sequence and confirms the kernel
+  survives. Sound as global (not per-CPU) state specifically because `int
+  0x80` runs with interrupts disabled for its whole body (see
+  `sys_read_line`'s doc comment) -- a real multi-process, interrupts-enabled-
+  during-syscalls kernel would need this state to be per-task instead.
+
+## Register dump on panic (M2/M4 addendum, post-M7)
+
+- **Cost:** O(1) -- each GPR-capture trampoline (`interrupts.rs`) is a fixed
+  15 `mov [addr], reg` instructions plus one `jmp`, run once per fault,
+  before the real (unchanged) exception handler's own O(1) dispatch.
+- **Alternative:** hand-parse the CPU-pushed exception frame directly in a
+  naked replacement for each handler, reconstructing `InterruptStackFrame`/
+  the error code from raw stack offsets instead of leaving that parsing to
+  the existing, compiler-generated `extern "x86-interrupt" fn` bodies.
+- **Tradeoff:** hand-parsing the frame would avoid the extra `jmp` (a
+  handful of cycles), but re-derives a stack layout the `x86_64` crate and
+  LLVM's `x86-interrupt` calling convention already get right today --
+  exactly the kind of place this codebase's own docs warn a wrong offset
+  "corrupts state silently" (see `task/context.rs`). The capture-then-jmp
+  trampoline touches no stack or flags state at all, so the real handler
+  sees identical CPU state to what plain `set_handler_fn` registration would
+  have produced, at the cost of one extra jump. Verified directly by
+  `tests/register_dump.rs`, which loads a known marker into `rax`
+  immediately before a deliberate, genuine kernel-mode page fault and
+  asserts the panic report's `rax=` field contains it exactly.

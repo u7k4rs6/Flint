@@ -33,6 +33,14 @@ name = "stack_overflow"
 harness = false
 
 [[test]]
+name = "task_stack_overflow"
+harness = false
+
+[[test]]
+name = "register_dump"
+harness = false
+
+[[test]]
 name = "null_page"
 harness = false
 

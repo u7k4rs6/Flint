@@ -1,8 +1,20 @@
-//! Ring 3 setup: mapping an isolated, minimal user address range and
-//! transitioning into it. No process model or ELF loader yet (M8 stretch)
-//! -- this builds exactly enough to run the hand-written demo programs in
-//! `program.rs` and `shell_program.rs` and prove the ring 3 / syscall /
-//! validation machinery actually works end to end.
+//! Ring 3 setup: building a private address space and transitioning into
+//! it. No ELF loader yet (M8 stretch) -- this builds exactly enough to run
+//! the hand-written demo programs in `program.rs` and `shell_program.rs` in
+//! their own page tables and prove the ring 3 / syscall / validation
+//! machinery actually works end to end, isolated from the kernel's own
+//! address space (PRD FR-MEM-2/FR-USER-1; see `paging::new_address_space`).
+//!
+//! Flint has no fork/exec: exactly one process is ever created per boot
+//! (`setup` or `setup_shell`, never both), always from the still-active
+//! boot address space, and the scheduler's ready queue is always empty for
+//! the whole time a process is running in every current entry point
+//! (`main.rs`, `tests/user_mode.rs`, `tests/shell.rs` never `spawn` a
+//! kernel thread before calling `enter_user_mode`) -- so `timer_tick` stays
+//! a no-op throughout and `context::switch` never needs to know about CR3.
+//! A future change that spawns kernel threads *and* runs a ring-3 process
+//! in the same boot would need to add CR3 save/restore to the context
+//! switch; this module deliberately does not build that.
 
 pub mod program;
 pub mod shell_program;
@@ -30,11 +42,27 @@ const USER_CODE_ADDR: u64 = 0x_2000_0000_0000;
 const USER_STACK_TOP: u64 = 0x_3000_0000_1000;
 const USER_STACK_SIZE: u64 = 4096;
 
-/// Maps a code page at `USER_CODE_ADDR` and a stack page at
-/// `USER_STACK_TOP`, copies `copy_len` bytes from `program_addr` into the
-/// code page, then makes it read-only + executable. Returns
+/// Builds a brand new, private address space (`paging::new_address_space`)
+/// and activates it, maps a code page at `USER_CODE_ADDR` and a stack page
+/// at `USER_STACK_TOP` into it, copies `copy_len` bytes from `program_addr`
+/// into the code page, then makes it read-only + executable. Returns
 /// `(entry_point, stack_top)` ready for `enter_user_mode`.
+///
+/// Activating the new address space first, before any of the mapping calls
+/// below, is what makes them land in the new table instead of the boot
+/// one: every one of them (including the trailing `update_flags` read-only
+/// flip) goes through `paging`'s single cached mapper, which
+/// `paging::activate` just repointed at this process's own table.
 fn map_program(program_addr: *const u8, copy_len: usize) -> (VirtAddr, VirtAddr) {
+    let boot_pml4 = x86_64::registers::control::Cr3::read().0;
+    let address_space = crate::memory::paging::new_address_space();
+    crate::memory::paging::activate(address_space);
+    crate::log_info!(
+        "private address space: PML4 {:?} (boot PML4 was {:?})",
+        address_space,
+        boot_pml4
+    );
+
     let code_page: Page<Size4KiB> = Page::containing_address(VirtAddr::new(USER_CODE_ADDR));
     // Mapped WRITABLE only long enough to copy the program's bytes in
     // below: even ring 0 cannot write through a page table entry that

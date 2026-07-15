@@ -6,6 +6,18 @@ ELF loader, ramdisk/filesystem, disk driver, SMP) was not attempted --
 explicitly out of scope for this run, left as a documented stub per the
 brief's own guidance, not a silent gap.
 
+**Post-M7, two further passes closed gaps between the M1-M7 build above and
+all four specs once Doc 1 (PRD) and Doc 4 (Console/CLI Spec) actually became
+available** (see "Source docs actually available" immediately below for why
+they weren't part of the original M1-M7 run): first, per-process address
+spaces (PRD Goals/FR-MEM-2/FR-USER-1); then eight further gaps found by
+auditing Docs 2-4 line by line against the shipped code -- VGA output, guard
+pages on kernel task stacks, a fault-safe syscall copy path, real register
+dumps on panic, structured log levels with task ids, a README, and a
+single-command debug launch. Both passes are detailed in DECISIONS.md and
+reflected throughout this file and the tables below; neither touched the
+specs themselves.
+
 Compiling is not booting, and booting is not passing. Every claim below
 states whether the harness actually boots and asserts it, and which test,
 not just whether the code compiles.
@@ -14,25 +26,28 @@ not just whether the code compiles.
 
 The build brief names four specs in `docs/`: a PRD (Doc 1), the technical
 architecture (Doc 2), isolation and privilege (Doc 3), and a console/CLI
-doc (Doc 4). Only Doc 2 and Doc 3 were ever attached to this session (Doc
-3 three times, identical); Doc 1 and Doc 4 were never provided. The build
-brief itself restates the PRD's milestone list, gates, and definition of
-done, and the shell's exact command set, inline, so the build proceeded
-on the brief plus Docs 2 and 3 as the source of truth rather than
-blocking on files that were never sent. Doc 2 and Doc 3 are checked into
-`docs/` for reference.
+doc (Doc 4). Only Doc 2 and Doc 3 were ever attached to the original M1-M7
+session (Doc 3 three times, identical); Doc 1 and Doc 4 were never provided
+at that time. The build brief itself restates the PRD's milestone list,
+gates, and definition of done, and the shell's exact command set, inline,
+so the original build proceeded on the brief plus Docs 2 and 3 as the
+source of truth rather than blocking on files that hadn't been sent. Doc 2
+and Doc 3 are checked into `docs/` for reference. Docs 1 and 4 (`files
+(1)/01_PRD.md`, `files (1)/04_CONSOLE_AND_CLI_SPEC.md`) were supplied in a
+later session, at which point the two gap-closure passes above brought the
+build in line with all four -- see DECISIONS.md.
 
 ## Functional requirements
 
 | Requirement | Status | Harness boots + asserts? | Test id |
 |---|---|---|---|
 | FR-BOOT (boot to Rust, long mode) | Implemented | Yes | `basic_boot::test_boots_and_prints` |
-| FR-OUT (serial output) | Implemented | Yes | `basic_boot::test_boots_and_prints`; every test in the suite prints and is read over serial |
-| FR-INT (GDT/TSS/IDT, exceptions, double-fault IST, PIC, timer, keyboard) | Implemented; keyboard (PS/2, IRQ1) wired and compiled but not exercised by an automated assertion (no PS/2 keystroke is injected in headless QEMU testing -- the shell's interactive I/O goes over the UART/serial path, not PS/2) | Yes for breakpoint + double-fault IST; no for keyboard | `flint::interrupts::tests::test_breakpoint_exception`, `stack_overflow::stack_overflow` |
-| FR-MEM (physical frame allocator, paging, heap) | Implemented | Yes | `flint::memory::tests::*`, `flint::memory::heap::tests::*`, `flint::memory::paging::tests::page_fault_on_lazy_region_is_handled_and_continues`, `null_page::null_page` |
-| FR-SCHED (task model, context switch, preemptive round robin) | Implemented | Yes | `flint::task::scheduler::tests::two_tasks_alternate_under_the_timer` |
-| FR-SYS (syscall boundary, user-pointer validation) | Implemented (`int 0x80`; `SYS_WRITE`, `SYS_EXIT`, `SYS_READ_LINE`, `SYS_SHELL_DISPATCH`; every pointer validated via a real page-table walk) | Yes | `user_mode::*` (hostile pointer rejected, kernel survives), `shell::*` (a writable-range validation, the copy-to-user direction) |
-| FR-USER (ring 3, first user program) | Implemented; no ELF loader or per-process address space (hand-written machine code, shared CR3 -- see DECISIONS.md) | Yes | `user_mode::*` |
+| FR-OUT (serial output, mirrored to VGA) | Implemented; VGA text-buffer output (`src/vga.rs`, Doc 2 section 3) added post-M7 -- key output (the boot banner, panics) mirrors to both channels | Yes | `basic_boot::test_boots_and_prints`; every test in the suite prints and is read over serial; `flint::vga::tests::printed_text_round_trips_through_the_buffer` |
+| FR-INT (GDT/TSS/IDT, exceptions, double-fault IST, PIC, timer, keyboard) | Implemented; keyboard (PS/2, IRQ1) wired and compiled but not exercised by an automated assertion (no PS/2 keystroke is injected in headless QEMU testing -- the shell's interactive I/O goes over the UART/serial path, not PS/2). Exception panics now carry a genuine, at-fault register dump (Doc 4 section 5) via naked GPR-capture trampolines added post-M7, see DECISIONS.md | Yes for breakpoint + double-fault IST + the register dump; no for keyboard | `flint::interrupts::tests::test_breakpoint_exception`, `stack_overflow::stack_overflow`, `register_dump::register_dump` |
+| FR-MEM (physical frame allocator, paging, heap, per-process address spaces) | Implemented; per-process address spaces (`paging::new_address_space`/`activate`) added post-M7, see DECISIONS.md's M6 addendum | Yes | `flint::memory::tests::*`, `flint::memory::heap::tests::*`, `flint::memory::paging::tests::page_fault_on_lazy_region_is_handled_and_continues`, `null_page::null_page`, `user_mode::*`/`shell::*` (each boots into its own private PML4, logged over serial) |
+| FR-SCHED (task model, context switch, preemptive round robin) | Implemented; kernel task stacks now mapped with an unmapped guard page immediately below (Doc 3 section 3), replacing a plain heap `Box<[u8]>`, added post-M7 | Yes | `flint::task::scheduler::tests::two_tasks_alternate_under_the_timer`, `task_stack_overflow::task_stack_overflow` |
+| FR-SYS (syscall boundary, user-pointer validation) | Implemented (`int 0x80`; `SYS_WRITE`, `SYS_EXIT`, `SYS_READ_LINE`, `SYS_SHELL_DISPATCH`; every pointer validated via a real page-table walk). The copy itself, not just the earlier validation, is now fault-safe too (`copy_from_user_byte`/`copy_to_user_byte`, Doc 3 sections 4/7), added post-M7 | Yes | `user_mode::*` (hostile pointer rejected, kernel survives), `shell::*` (a writable-range validation, the copy-to-user direction), `flint::syscall::tests::copy_helpers_return_err_instead_of_panicking_on_a_mid_copy_fault` |
+| FR-USER (ring 3, first user program, own address space) | Implemented; no ELF loader (hand-written machine code, per Doc 2 section 7.3's stretch note) but a real per-process address space -- a fresh PML4 cloned from the boot table, see DECISIONS.md's M6 addendum | Yes | `user_mode::*` |
 | FR-SHELL (user-space shell over serial: help, echo, meminfo, ps, ticks/uptime) | Implemented; command control flow runs in ring 3, command *parsing* runs in the kernel behind a syscall (see DECISIONS.md) | Yes | `flint::shell::tests::*` (dispatch logic), `shell::*` (full ring-3 loop against scripted input) |
 
 M8 (ELF loader, ramdisk/filesystem, disk driver, SMP): not done. Not
@@ -106,6 +121,26 @@ before touching M8.
   and transcript -- but is not the automated harness path, since piping
   external stdin through the full `cargo test` process chain reliably
   would not make a good boot-and-assert gate.
+- **Doc 2-4 gap closure (post-M7):** once Docs 1 and 4 actually reached this
+  build, a line-by-line audit against all four specs found eight further
+  gaps, all closed here (per-process address spaces were a separate, earlier
+  pass -- see the M6 addendum in DECISIONS.md). VGA text output (`src/vga.rs`,
+  Doc 2 section 3); a `README.md` and a `Makefile` `debug` target (Doc 4
+  section 6); structured `log_trace!`/`log_debug!`/`log_info!`/`log_warn!`/
+  `log_error!` macros carrying a task id (Doc 4 section 2); kernel task
+  stacks bounded by an unmapped guard page instead of a plain heap `Box`
+  (Doc 3 section 3); a fault-safe `copy_from_user_byte`/`copy_to_user_byte`
+  path replacing raw, unchecked syscall copies (Doc 3 sections 4/7); and
+  naked GPR-capture trampolines giving panic reports a genuine, at-fault
+  register dump (Doc 4 section 5), plus an honestly-labeled best-effort
+  fallback for a plain `panic!()` with no hardware trap frame behind it.
+  Green: `flint::vga::tests::printed_text_round_trips_through_the_buffer`,
+  `task_stack_overflow::task_stack_overflow`,
+  `flint::syscall::tests::copy_helpers_return_err_instead_of_panicking_on_a_mid_copy_fault`,
+  `register_dump::register_dump` (which asserts an exact register-value
+  match, not just "didn't crash"). Full reasoning, including the design
+  tradeoffs considered and rejected for the riskier pieces (the copy-fault
+  fixup, the register-dump trampolines), is in DECISIONS.md.
 
 ## What is stubbed or unfinished, and why
 
@@ -114,12 +149,18 @@ before touching M8.
   own priority ("A verified scheduler with no user mode is a real result;
   a half-wired ring 3 that triple-faults is not" -- the same logic applies
   one tier up).
-- **No ELF loader or per-process address space.** Every task (M5 kernel
-  threads, the M6 demo program, the M7 shell) shares the kernel's single
-  CR3. Both user programs are hand-written, position-independent machine
-  code copied into isolated pages, not loaded from a binary format. A
-  natural, explicitly deferred extension (Doc 2 section 7.3 explicitly
-  calls ELF loading a stretch goal).
+- **No ELF loader.** Both user programs (the M6 demo, the M7 shell) are
+  hand-written, position-independent machine code copied into isolated
+  pages, not loaded from a binary format. A natural, explicitly deferred
+  extension (Doc 2 section 7.3 explicitly calls ELF loading a stretch
+  goal). Per-process address spaces, previously also listed here as
+  deferred, are now implemented -- see the M6 addendum in DECISIONS.md and
+  the FR-MEM-2/FR-USER-1 row above: each process gets its own PML4, cloned
+  from the boot table so the kernel stays reachable, with the process's own
+  code/stack/buffer pages invisible to any other table. Kernel threads (M5)
+  are unaffected -- they still share the kernel's single CR3, since they
+  never had their own address space to begin with and this addendum only
+  touches ring-3 process creation.
 - **Shell command parsing runs behind a syscall, in the kernel**, not in
   ring-3 code. The shell *process* (its loop, its syscalls, its exit
   decision) genuinely runs in ring 3; the string matching for `help` vs
@@ -153,23 +194,22 @@ Nothing here is reported as done that only compiles. Every item in the
 
 ## Commands
 
-- Build: `cargo build`
-- Boot interactively (drops straight into the shell -- try `help`):
-  `cargo run`. Headless QEMU, serial to stdout. Runs until you type
-  `exit`, after which the kernel halts; Ctrl-C to stop earlier.
-- Run the full harness: `cargo test`
+See `README.md` for the four canonical commands (build/run/test/debug) --
+Doc 4 section 6's own requirement, added post-M7 along with the `Makefile`
+`debug` target now backing the last of the four (previously a hand-typed
+QEMU invocation, documented only here).
+
 - Run one integration test: `cargo test --test <name>` (`basic_boot`,
-  `stack_overflow`, `null_page`, `user_mode`, `shell`)
+  `stack_overflow`, `task_stack_overflow`, `null_page`, `register_dump`,
+  `user_mode`, `shell`)
 - Manually drive a live interactive session over real serial I/O (not the
-  scripted-input test path): after `cargo build`,
+  scripted-input test path, and not `cargo run`'s own headless invocation):
+  after `cargo build`,
   `qemu-system-x86_64 -drive format=raw,file=target/x86_64-flint/debug/bootimage-flint.bin -device isa-debug-exit,iobase=0xf4,iosize=0x04 -serial stdio -display none -no-reboot`
-- gdb-stub debugging (for the finicky milestones -- the context switch,
-  the ring-3/syscall boundary): after `cargo build`,
-  `qemu-system-x86_64 -drive format=raw,file=target/x86_64-flint/debug/bootimage-flint.bin -serial stdio -display none -s -S`,
-  then in another shell: `gdb -ex "target remote :1234"`
 - QEMU interrupt-log diagnostics (used during the build to diagnose the
-  M6 code-page write fault; see DECISIONS.md): add
-  `-d int,cpu_reset -D /path/to/log.txt` to any of the above.
+  M6 code-page write fault; see DECISIONS.md; `make debug` already includes
+  this by default): add `-d int,cpu_reset -D /path/to/log.txt` to any of
+  the above.
 
 Environment notes for reproducing this build: `qemu-system-x86` and
 `bootimage`/`cargo-bootimage` are not preinstalled and were installed

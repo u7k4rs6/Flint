@@ -12,6 +12,7 @@
 extern crate alloc;
 
 pub mod serial;
+pub mod vga;
 pub mod qemu;
 pub mod gdt;
 pub mod interrupts;
@@ -49,6 +50,10 @@ pub fn init_memory(boot_info: &'static bootloader::BootInfo) {
     // this entry point via `entry_point!`, and this runs once during boot
     // before anything could have allocated a frame.
     unsafe { memory::init(&boot_info.memory_map, boot_info.physical_memory_offset) };
+    // SAFETY: the physical-memory offset mapping `vga::init` reaches 0xb8000
+    // through was just established by `memory::init` above, and this is the
+    // only call to `vga::init` in every entry point (test or not).
+    unsafe { vga::init() };
 }
 
 /// Starts the scheduler with an empty ready queue. Separate from `init`
