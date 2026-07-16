@@ -32,10 +32,10 @@ at that time. The build brief itself restates the PRD's milestone list,
 gates, and definition of done, and the shell's exact command set, inline,
 so the original build proceeded on the brief plus Docs 2 and 3 as the
 source of truth rather than blocking on files that hadn't been sent. Doc 2
-and Doc 3 are checked into `docs/` for reference. Docs 1 and 4 (`files
-(1)/01_PRD.md`, `files (1)/04_CONSOLE_AND_CLI_SPEC.md`) were supplied in a
-later session, at which point the two gap-closure passes above brought the
-build in line with all four -- see DECISIONS.md.
+and Doc 3 are checked into `docs/` for reference. Docs 1 and 4 (a PRD and a
+console/CLI spec) were supplied in a later session -- not checked into this
+repo -- at which point the two gap-closure passes above brought the build
+in line with all four; see DECISIONS.md.
 
 ## Functional requirements
 

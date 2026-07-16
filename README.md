@@ -4,7 +4,7 @@ A small x86-64 kernel, written in Rust, that boots under QEMU: a physical
 and virtual memory manager, a kernel heap, a preemptive scheduler, a
 syscall boundary with per-process address spaces, and a user-space shell.
 See `SUMMARY.md`, `PROGRESS.md`, and `DECISIONS.md` for the full build
-record, and `files (1)/` for the specs Flint is built against.
+record.
 
 ## Prerequisites
 
