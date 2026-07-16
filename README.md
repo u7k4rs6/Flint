@@ -10,16 +10,35 @@
 
 </div>
 
-Flint starts at the reset vector and stops at a prompt. In between: a physical
-and virtual memory manager, a kernel heap, a preemptive scheduler, a syscall
-boundary with per-process address spaces, and a user-space shell.
+Flint is a hobby kernel. I wrote it to find out what the hardware actually
+requires between power and a prompt, because reading about it turned out to be
+nothing like having to make it work.
 
-Nothing here is a wrapper. The page tables are built by hand, the context
-switch is inline assembly, and the shell is a real ring 3 process that has to
-ask the kernel for everything it wants.
+The `bootloader` crate gets the CPU into long mode and hands over a memory map.
+Everything after that is Flint's.
 
-Colour means privilege everywhere below: **grey is hardware**, **ember is ring
-0**, **violet is ring 3**.
+## What it does
+
+- **Traps and descriptors.** A GDT with a TSS, an IDT with 256 vectors, and
+  separate IST stacks for the faults that show up when the stack is already the
+  problem.
+- **Virtual memory.** Four-level paging, 4 KiB pages, one address space per
+  process, the kernel mapped into every one of them.
+- **Physical memory.** A frame allocator over the bootloader's memory map, with
+  a linked-list kernel heap on top of it.
+- **Processes.** Preemptive round-robin on a 100 Hz timer, one tick per
+  quantum, `rsp` and `cr3` swapped on the way out.
+- **Ring 3.** A syscall boundary that user code has to ask through for
+  everything, including the ability to print a character.
+- **A shell.** `help`, `ps`, `meminfo`, `exit`, over the serial line.
+- **Tests.** Seven integration tests, each one booted under QEMU by
+  `cargo test`.
+
+## What it doesn't
+
+No filesystem, no disk, no network, no SMP. No loader either: the shell is
+compiled into the kernel image, so `ps` will never show you something you did
+not build. One core, and everything it knows disappears when you type `exit`.
 
 ## Four commands
 
@@ -39,47 +58,77 @@ Ubuntu), and `cargo install bootimage`.
 
 <img src="assets/chip.svg" width="880" alt="Diagram of Flint's subsystems laid out as blocks on a chip package: boot, GDT and TSS, IDT, long mode, frame allocator, paging, kernel heap, syscall gate, scheduler, context switch, shell and UART. A highlight sweeps across and lights each block in turn.">
 
-Twelve blocks, in roughly the order they come alive. Everything left of the
-syscall gate exists so that the two blocks on the right can be told *no*.
+Twelve blocks, roughly in the order they come up. The order is not a preference,
+it is a dependency chain: the heap cannot exist before paging, paging cannot
+survive a fault before the IDT, and nothing can report that it failed before the
+UART works. That is why the serial console is the first thing Flint brings up
+and the last thing it gives up.
+
+Grey is hardware, ember is ring 0, violet is ring 3, here and in every diagram
+below.
 
 ## Memory
 
-Every user address is a lie the CPU tells four times before it means anything.
-Flint walks all four levels itself, and keeps one address space per process.
+An x86-64 virtual address is four 9-bit indexes and a 12-bit offset. `cr3`
+points at the PML4, each level narrows the search by a factor of 512, and the
+entry at the bottom names a 4 KiB frame. Flint walks it by hand, which is four
+memory loads to resolve one address, right up until the TLB starts remembering
+the answer.
 
 <img src="assets/pagewalk.svg" width="880" alt="Animated four-level page walk. A virtual address is split into its index fields, then PML4, PDPT, PD and PT light up in sequence with a pulse travelling between them, ending at a physical frame.">
 
-Underneath the walk is a frame allocator handing out 4 KiB pages: the kernel
-image and page tables first, then the heap, then user pages that come back when
-a process exits.
+Every process gets its own PML4, and the kernel is mapped into the top of all of
+them. That part is not decoration: an interrupt can arrive while user code owns
+the CPU, and the handler has to be at a valid address the instant it does.
+
+Underneath the walk is the frame allocator. The kernel image and the page tables
+take theirs first, then the heap, then user pages, which come back when a
+process exits.
 
 <img src="assets/heap.svg" width="880" alt="Animated grid of physical page frames filling up in batches: kernel image, page tables, kernel heap, then user pages, with ten user frames returning to the free pool when the process exits.">
 
 ## Scheduling
 
-A timer interrupt at 100 Hz, a round-robin queue, and a context switch that
-swaps `rsp` and `cr3`. No process is asked to be polite.
+The timer fires at 100 Hz, and every tick is a scheduling decision. The handler
+saves the interrupted context, picks the next runnable task, swaps `rsp` and
+`cr3`, and returns into somebody else. Nothing here cooperates: a task that
+spins forever still loses the CPU on the next tick, which is the entire point of
+doing it this way.
 
 <img src="assets/scheduler.svg" width="880" alt="Animated scheduler view. A CPU panel shows the current process, its stack pointer, page table root and privilege ring, while a run queue rotates the running slot between idle, init, shell and ticker. A timer interrupt fires between each quantum.">
+
+The first switch into a new task is the awkward one. There is no saved context
+to restore, so the kernel writes a stack frame by hand that looks exactly like
+one an interrupt would have left behind, and lets `iretq` believe it.
 
 ## Interrupts
 
 <img src="assets/interrupt.svg" width="880" alt="Animated interrupt path. A pulse travels from a keypress through the IDT vector, the keyboard ISR and the scheduler, and ends at the ring 3 shell, which echoes a character.">
 
-The shell blocks on a read, a scancode arrives, the IDT hands the CPU to an
-ISR, the scheduler unblocks pid 2, and a character appears. Five stops, and the
-shell never learns it was ever asleep.
+The shell blocks on a read. A key press becomes a scancode, the CPU vectors
+through `IDT[0x21]` into the keyboard ISR, the ISR acknowledges the PIC and
+marks pid 2 runnable, and the scheduler hands it back the CPU. From inside the
+shell, `read` just returned.
+
+The faults that can fire while the stack is already broken get their own stack,
+through the IST entries in the TSS. Skip that and a stack overflow escalates
+into a triple fault, at which point QEMU silently resets and you get to find out
+how good your notes are.
 
 ## The shell
 
-A ring 3 process, pid 2, talking to the kernel through the syscall gate and to
-you through the UART.
-
 <img src="assets/shell.svg" width="880" alt="Animated terminal session. Commands help, ps, meminfo and exit are typed one character at a time, each printing its output, ending with the kernel halted.">
+
+pid 2, ring 3, and it owns nothing. No port I/O, no page tables of its own to
+edit, no way to reach another process's memory. Every character it prints is a
+syscall the kernel agreed to, and `exit` is a syscall too: the shell asks to be
+killed, and the kernel halts once nothing runnable is left.
 
 ## Tests
 
-`cargo test` boots each of these under QEMU and reports over serial.
+`cargo test` builds each of these into its own kernel image and boots it under
+QEMU. The result comes back as a process exit code, so a failure is a red
+`cargo test` rather than a window that hangs.
 
 | test | asserts |
 |---|---|
@@ -91,6 +140,9 @@ you through the UART.
 | `user_mode` | A process enters ring 3 and returns through the syscall gate. |
 | `shell` | The shell answers commands over serial. |
 
+Four of the seven exist because the kernel lied to me once and I would rather it
+not do it again quietly.
+
 ## Reading the repo
 
 | | |
@@ -100,15 +152,8 @@ you through the UART.
 | `DECISIONS.md` | Why each fork in the road went the way it did. |
 | `COMPLEXITY.md` | Cost, alternative, and tradeoff for every core operation. |
 
-## About these animations
+If you only open one, open `DECISIONS.md`. The code says what Flint does;
+that file says what else it could have done and why it doesn't.
 
-Every diagram above is one SVG file with CSS keyframes inside it. No
-JavaScript, no GIFs, no external requests, nothing that GitHub strips out of a
-README. They are generated, not drawn: edit `assets/gen.py` and run it.
 
-```
-python3 assets/gen.py
-```
-
-They also honour `prefers-reduced-motion`, in which case each one freezes on
-its last frame instead of looping.
+They honour `prefers-reduced-motion` by freezing on their last frame.
