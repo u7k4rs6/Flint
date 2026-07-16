@@ -155,5 +155,3 @@ not do it again quietly.
 If you only open one, open `DECISIONS.md`. The code says what Flint does;
 that file says what else it could have done and why it doesn't.
 
-
-They honour `prefers-reduced-motion` by freezing on their last frame.
